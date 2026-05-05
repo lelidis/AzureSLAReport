@@ -41,32 +41,6 @@
           "validationMessage": "3-24 lowercase letters or digits."
         },
         "visible": true
-      },
-      {
-        "name": "functionAppName",
-        "type": "Microsoft.Common.TextBox",
-        "label": "Function App name (optional)",
-        "defaultValue": "",
-        "toolTip": "Leave blank to auto-generate.",
-        "constraints": {
-          "required": false,
-          "regex": "^$|^[a-zA-Z0-9-]{2,60}$",
-          "validationMessage": "2-60 chars, alphanumeric and hyphens. Leave blank to auto-generate."
-        },
-        "visible": true
-      },
-      {
-        "name": "appServicePlanName",
-        "type": "Microsoft.Common.TextBox",
-        "label": "App Service plan name (optional)",
-        "defaultValue": "",
-        "toolTip": "Leave blank to auto-generate.",
-        "constraints": {
-          "required": false,
-          "regex": "^$|^[a-zA-Z0-9-]{2,60}$",
-          "validationMessage": "2-60 chars, alphanumeric and hyphens. Leave blank to auto-generate."
-        },
-        "visible": true
       }
     ],
     "steps": [],
@@ -74,9 +48,7 @@
       "location": "[location()]",
       "workspaceName": "[basics('workspaceName')]",
       "workspaceRetentionDays": "[int(basics('workspaceRetentionDays'))]",
-      "storageAccountName": "[basics('storageAccountName')]",
-      "functionAppName": "[if(empty(basics('functionAppName')), concat('func-sla-', take(replace(guid(subscription().id, basics('workspaceName')), '-', ''), 8)), basics('functionAppName'))]",
-      "appServicePlanName": "[if(empty(basics('appServicePlanName')), concat('asp-sla-', take(replace(guid(subscription().id, basics('workspaceName')), '-', ''), 8)), basics('appServicePlanName'))]"
+      "storageAccountName": "[basics('storageAccountName')]"
     }
   }
 }
