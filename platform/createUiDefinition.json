@@ -1,0 +1,82 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/0.1.2-preview/CreateUIDefinition.MultiVm.json#",
+  "handler": "Microsoft.Azure.CreateUIDef",
+  "version": "0.1.2-preview",
+  "parameters": {
+    "basics": [
+      {
+        "name": "workspaceName",
+        "type": "Microsoft.Common.TextBox",
+        "label": "Log Analytics workspace name",
+        "defaultValue": "law-sla-prod",
+        "toolTip": "Name of the Log Analytics workspace to create. Must be unique within the resource group.",
+        "constraints": {
+          "required": true,
+          "regex": "^[a-zA-Z0-9][a-zA-Z0-9-]{2,61}[a-zA-Z0-9]$",
+          "validationMessage": "4-63 chars, alphanumeric and hyphens, must start and end with alphanumeric."
+        },
+        "visible": true
+      },
+      {
+        "name": "workspaceRetentionDays",
+        "type": "Microsoft.Common.Slider",
+        "label": "Workspace retention (days)",
+        "min": 30,
+        "max": 730,
+        "defaultValue": 400,
+        "showStepMarkers": false,
+        "toolTip": "Use 400 to support 12+ month SLA reports.",
+        "constraints": { "required": true },
+        "visible": true
+      },
+      {
+        "name": "storageAccountName",
+        "type": "Microsoft.Common.TextBox",
+        "label": "Storage account name",
+        "defaultValue": "",
+        "toolTip": "Globally unique. 3-24 lowercase letters or digits.",
+        "constraints": {
+          "required": true,
+          "regex": "^[a-z0-9]{3,24}$",
+          "validationMessage": "3-24 lowercase letters or digits."
+        },
+        "visible": true
+      },
+      {
+        "name": "functionAppName",
+        "type": "Microsoft.Common.TextBox",
+        "label": "Function App name (optional)",
+        "defaultValue": "",
+        "toolTip": "Leave blank to auto-generate.",
+        "constraints": {
+          "required": false,
+          "regex": "^$|^[a-zA-Z0-9-]{2,60}$",
+          "validationMessage": "2-60 chars, alphanumeric and hyphens. Leave blank to auto-generate."
+        },
+        "visible": true
+      },
+      {
+        "name": "appServicePlanName",
+        "type": "Microsoft.Common.TextBox",
+        "label": "App Service plan name (optional)",
+        "defaultValue": "",
+        "toolTip": "Leave blank to auto-generate.",
+        "constraints": {
+          "required": false,
+          "regex": "^$|^[a-zA-Z0-9-]{2,60}$",
+          "validationMessage": "2-60 chars, alphanumeric and hyphens. Leave blank to auto-generate."
+        },
+        "visible": true
+      }
+    ],
+    "steps": [],
+    "outputs": {
+      "location": "[location()]",
+      "workspaceName": "[basics('workspaceName')]",
+      "workspaceRetentionDays": "[int(basics('workspaceRetentionDays'))]",
+      "storageAccountName": "[basics('storageAccountName')]",
+      "functionAppName": "[if(empty(basics('functionAppName')), concat('func-sla-', uniqueString(resourceGroup().id)), basics('functionAppName'))]",
+      "appServicePlanName": "[if(empty(basics('appServicePlanName')), concat('asp-sla-', uniqueString(resourceGroup().id)), basics('appServicePlanName'))]"
+    }
+  }
+}

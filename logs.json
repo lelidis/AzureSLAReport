@@ -1,0 +1,10 @@
+[
+  {"category":"ResourceHealth","enabled":true},
+  {"category":"Administrative","enabled":true},
+  {"category":"Security","enabled":false},
+  {"category":"ServiceHealth","enabled":false},
+  {"category":"Alert","enabled":false},
+  {"category":"Recommendation","enabled":false},
+  {"category":"Policy","enabled":false},
+  {"category":"Autoscale","enabled":false}
+]

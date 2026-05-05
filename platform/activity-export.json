@@ -1,0 +1,111 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2018-05-01/subscriptionDeploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "metadata": {
+    "_generator": {
+      "name": "bicep",
+      "version": "0.42.1.51946",
+      "templateHash": "531119157556582993"
+    }
+  },
+  "parameters": {
+    "workspaceResourceId": {
+      "type": "string",
+      "metadata": {
+        "description": "Full resource ID of the Log Analytics workspace receiving Activity Log."
+      }
+    },
+    "readerPrincipalId": {
+      "type": "string",
+      "metadata": {
+        "description": "Object ID granted Reader on this subscription (for ARG inventory in the workbook)."
+      }
+    },
+    "principalType": {
+      "type": "string",
+      "defaultValue": "ServicePrincipal",
+      "allowedValues": [
+        "User",
+        "Group",
+        "ServicePrincipal"
+      ],
+      "metadata": {
+        "description": "Principal type for the role assignment."
+      }
+    },
+    "settingName": {
+      "type": "string",
+      "defaultValue": "to-sla-workspace",
+      "metadata": {
+        "description": "Diagnostic setting name."
+      }
+    }
+  },
+  "variables": {
+    "readerRoleId": "acdd72a7-3385-48ef-bd42-f606fba81ae7"
+  },
+  "resources": [
+    {
+      "type": "Microsoft.Insights/diagnosticSettings",
+      "apiVersion": "2021-05-01-preview",
+      "name": "[parameters('settingName')]",
+      "properties": {
+        "workspaceId": "[parameters('workspaceResourceId')]",
+        "logs": [
+          {
+            "category": "Administrative",
+            "enabled": true
+          },
+          {
+            "category": "ResourceHealth",
+            "enabled": true
+          },
+          {
+            "category": "ServiceHealth",
+            "enabled": false
+          },
+          {
+            "category": "Alert",
+            "enabled": false
+          },
+          {
+            "category": "Autoscale",
+            "enabled": false
+          },
+          {
+            "category": "Policy",
+            "enabled": false
+          },
+          {
+            "category": "Recommendation",
+            "enabled": false
+          },
+          {
+            "category": "Security",
+            "enabled": false
+          }
+        ]
+      }
+    },
+    {
+      "type": "Microsoft.Authorization/roleAssignments",
+      "apiVersion": "2022-04-01",
+      "name": "[guid(subscription().id, parameters('readerPrincipalId'), variables('readerRoleId'))]",
+      "properties": {
+        "principalId": "[parameters('readerPrincipalId')]",
+        "principalType": "[parameters('principalType')]",
+        "roleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('readerRoleId'))]"
+      }
+    }
+  ],
+  "outputs": {
+    "diagnosticSettingId": {
+      "type": "string",
+      "value": "[subscriptionResourceId('Microsoft.Insights/diagnosticSettings', parameters('settingName'))]"
+    },
+    "readerRoleAssignmentId": {
+      "type": "string",
+      "value": "[subscriptionResourceId('Microsoft.Authorization/roleAssignments', guid(subscription().id, parameters('readerPrincipalId'), variables('readerRoleId')))]"
+    }
+  }
+}

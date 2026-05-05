@@ -1,0 +1,23 @@
+# Build artifacts / local-only files
+*.log
+*.tmp
+.DS_Store
+Thumbs.db
+
+# VS Code workspace cruft (keep settings if desired)
+.vscode/*.log
+
+# Bicep / ARM build outputs are committed (needed by the Deploy to Azure button),
+# but local Bicep tooling sometimes drops these:
+*.bicepparam.local
+
+# Function app local artifacts
+platform/function/bin/
+platform/function/obj/
+platform/function/local.settings.json
+
+# PowerShell module cache
+**/Modules/
+
+# Azure CLI / Bicep installer leftovers
+*.deployment.json.tmp

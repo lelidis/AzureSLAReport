@@ -1,0 +1,88 @@
+// ============================================================================
+//  KQL queries for the Azure Compute Availability SLA report.
+//  Run against the Log Analytics workspace receiving ResourceHealthEvent.
+//
+//  Tables used:
+//    AzureActivity / ResourceHealthEvent (preferred, modern)
+//    or, for older diag settings: AzureDiagnostics where Category=='ResourceHealth'
+//
+//  Customize the @start/@end variables, then save as Workbook parameters.
+// ============================================================================
+
+// ----------------------------------------------------------------------------
+// 0. Common: time window
+// ----------------------------------------------------------------------------
+let _start = startofmonth(datetime('2026-03-01'));
+let _end   = startofmonth(datetime('2026-04-01'));
+let _windowSec = toreal(datetime_diff('second', _end, _start));
+
+// ----------------------------------------------------------------------------
+// 1. Per-resource availability % for a single month
+// ----------------------------------------------------------------------------
+let HealthEvents =
+    ResourceHealthEvent
+    | where TimeGenerated between (_start .. _end + 1h)   // overlap window
+    | where ResourceType in~ ('virtualMachines','virtualMachineScaleSets')
+    | extend ResourceId   = tolower(_ResourceId),
+             AvailState   = tostring(properties.currentHealthStatus),
+             OccuredTime  = todatetime(properties.eventTimestamp);
+let StateSegments =
+    HealthEvents
+    | order by ResourceId asc, OccuredTime asc
+    | extend NextTime = next(OccuredTime, 1, _end)
+    | extend SegStart = iff(OccuredTime < _start, _start, OccuredTime),
+             SegEnd   = iff(NextTime  > _end,   _end,   NextTime)
+    | where SegEnd > SegStart
+    | extend SegSec = datetime_diff('second', SegEnd, SegStart),
+             IsDown = AvailState != 'Available';
+let PerResource =
+    StateSegments
+    | summarize DownSec = sumif(SegSec, IsDown), Samples = count() by ResourceId
+    | extend AvailabilityPct = round( ((_windowSec - DownSec) / _windowSec) * 100, 4),
+             UnavailableMin  = round(DownSec / 60.0, 2);
+PerResource
+| join kind=leftouter (
+    Resources                    // Resource Graph in LA via heartbeat? -> see note below
+  ) on ResourceId
+
+// NOTE: Resource Graph isn't in LA. Instead enrich via ARG join in the workbook,
+// or join with a watchlist refreshed by the Function App.
+
+// ----------------------------------------------------------------------------
+// 2. Region x Month uptime matrix (12 months)
+// ----------------------------------------------------------------------------
+let MatrixStart = startofmonth(datetime_add('month', -11, now()));
+let MatrixEnd   = startofmonth(now()) + 1d;   // include current month-to-date
+ResourceHealthEvent
+| where TimeGenerated between (MatrixStart .. MatrixEnd)
+| where ResourceType in~ ('virtualMachines','virtualMachineScaleSets')
+| extend ResourceId  = tolower(_ResourceId),
+         AvailState  = tostring(properties.currentHealthStatus),
+         OccuredTime = todatetime(properties.eventTimestamp),
+         Region      = tostring(Location)
+| order by ResourceId asc, OccuredTime asc
+| extend NextTime = next(OccuredTime, 1, MatrixEnd)
+| mv-expand m = range(0, 11) to typeof(int)
+| extend WStart = startofmonth(datetime_add('month', m - 11, now())),
+         WEnd   = startofmonth(datetime_add('month', m - 10, now()))
+| extend SegStart = iff(OccuredTime < WStart, WStart, OccuredTime),
+         SegEnd   = iff(NextTime  > WEnd,   WEnd,   NextTime)
+| where SegEnd > SegStart and SegStart >= WStart and SegEnd <= WEnd
+| extend SegSec = datetime_diff('second', SegEnd, SegStart),
+         IsDown = AvailState != 'Available',
+         WSec   = datetime_diff('second', WEnd, WStart),
+         Month  = format_datetime(WStart, 'yyyy-MM')
+| summarize DownSec = sumif(SegSec, IsDown), TotalSec = sum(SegSec), WindowSec = max(WSec)
+          by Region, Month
+| extend AvailabilityPct = round( ((WindowSec - DownSec) / WindowSec) * 100, 4)
+| project Region, Month, AvailabilityPct
+| evaluate pivot(Month, max(AvailabilityPct))
+| order by Region asc
+
+// ----------------------------------------------------------------------------
+// 3. Tenant rollup: avg availability + breach count by SLA tier
+//    (tier comes from a watchlist refreshed by the Function App, see notes)
+// ----------------------------------------------------------------------------
+// _GetWatchlist('ComputeSlaTiers')
+// | join kind=inner PerResource on ResourceId
+// | summarize Avg=avg(AvailabilityPct), Breaches=countif(AvailabilityPct < CommittedSlaPct) by SlaTier
