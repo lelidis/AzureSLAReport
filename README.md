@@ -1,7 +1,7 @@
 # Azure Availability SLA Report
 
-[![Deploy to Azure](https://aka.ms/deploytoazurebutton)](https://portal.azure.com/#create/Microsoft.Template/uri/https%3A%2F%2Fraw.githubusercontent.com%2Fnilelidi%2FAzureSlaReport%2Fmain%2Fplatform%2Fmain.json/createUIDefinitionUri/https%3A%2F%2Fraw.githubusercontent.com%2Fnilelidi%2FAzureSlaReport%2Fmain%2Fplatform%2FcreateUiDefinition.json)
-[![Visualize](https://raw.githubusercontent.com/Azure/azure-quickstart-templates/master/1-CONTRIBUTION-GUIDE/images/visualizebutton.svg?sanitize=true)](https://armviz.io/#/?load=https%3A%2F%2Fraw.githubusercontent.com%2Fnilelidi%2FAzureSlaReport%2Fmain%2Fplatform%2Fmain.json)
+[![Deploy to Azure](https://aka.ms/deploytoazurebutton)](https://portal.azure.com/#create/Microsoft.Template/uri/https%3A%2F%2Fraw.githubusercontent.com%2Flelidis%2FAzureSLAReport%2Fmain%2Fplatform%2Fmain.json/createUIDefinitionUri/https%3A%2F%2Fraw.githubusercontent.com%2Flelidis%2FAzureSLAReport%2Fmain%2Fplatform%2FcreateUiDefinition.json)
+[![Visualize](https://raw.githubusercontent.com/Azure/azure-quickstart-templates/master/1-CONTRIBUTION-GUIDE/images/visualizebutton.svg?sanitize=true)](https://armviz.io/#/?load=https%3A%2F%2Fraw.githubusercontent.com%2Flelidis%2FAzureSLAReport%2Fmain%2Fplatform%2Fmain.json)
 
 Self-service Azure Workbook + Bicep platform that produces platform-availability SLA reports across many Azure services from `AzureActivity` Resource Health events, enriched with an Azure Resource Graph (ARG) inventory so even 100%-healthy resources appear.
 
@@ -50,11 +50,11 @@ You can deploy the hub three ways. Pick whichever fits your audience; all three 
 
 Click the button at the top of this README, or use this direct link:
 
-> https://portal.azure.com/#create/Microsoft.Template/uri/https%3A%2F%2Fraw.githubusercontent.com%2Fnilelidi%2FAzureSlaReport%2Fmain%2Fplatform%2Fmain.json/createUIDefinitionUri/https%3A%2F%2Fraw.githubusercontent.com%2Fnilelidi%2FAzureSlaReport%2Fmain%2Fplatform%2FcreateUiDefinition.json
+> https://portal.azure.com/#create/Microsoft.Template/uri/https%3A%2F%2Fraw.githubusercontent.com%2Flelidis%2FAzureSLAReport%2Fmain%2Fplatform%2Fmain.json/createUIDefinitionUri/https%3A%2F%2Fraw.githubusercontent.com%2Flelidis%2FAzureSLAReport%2Fmain%2Fplatform%2FcreateUiDefinition.json
 
 The portal will prompt for subscription, resource group, location, workspace name, storage account name, and (optional) Function App / plan names — no CLI required. The button references [platform/main.json](platform/main.json) and [platform/createUiDefinition.json](platform/createUiDefinition.json) over `raw.githubusercontent.com`, so the repo and those two files must be public.
 
-If you fork this repo, swap `nilelidi/AzureSlaReport/main` in the URL above for `<owner>/<repo>/<branch>`.
+If you fork this repo, swap `lelidis/AzureSLAReport/main` in the URL above for `<owner>/<repo>/<branch>`.
 
 ### Option B — ARM JSON via Azure CLI
 
