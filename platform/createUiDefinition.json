@@ -75,8 +75,8 @@
       "workspaceName": "[basics('workspaceName')]",
       "workspaceRetentionDays": "[int(basics('workspaceRetentionDays'))]",
       "storageAccountName": "[basics('storageAccountName')]",
-      "functionAppName": "[if(empty(basics('functionAppName')), concat('func-sla-', uniqueString(resourceGroup().id)), basics('functionAppName'))]",
-      "appServicePlanName": "[if(empty(basics('appServicePlanName')), concat('asp-sla-', uniqueString(resourceGroup().id)), basics('appServicePlanName'))]"
+      "functionAppName": "[if(empty(basics('functionAppName')), concat('func-sla-', take(replace(guid(subscription().id, basics('workspaceName')), '-', ''), 8)), basics('functionAppName'))]",
+      "appServicePlanName": "[if(empty(basics('appServicePlanName')), concat('asp-sla-', take(replace(guid(subscription().id, basics('workspaceName')), '-', ''), 8)), basics('appServicePlanName'))]"
     }
   }
 }
