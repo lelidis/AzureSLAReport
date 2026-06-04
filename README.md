@@ -120,13 +120,25 @@ Outputs include:
 
 The template (button, ARM, or Bicep) provisions the infrastructure but does **not** turn on the static website, push the Function code, or grant the Function the subscription access it needs for the inventory. Run these three steps once after any of Option A/B/C.
 
-Set these from the deployment outputs first:
+> **Set `$rg` to the resource group you actually deployed into.** `rg-sla-monitoring` is only an example. With the portal button (Option A) you pick or create the RG in the form, so it may be anything (e.g. `rg-slareport08`). With Options B/C it's the name you passed to `az group create`. If you set the wrong name here, the next commands fail with `ResourceGroupNotFound` even though a group exists — the name simply doesn't match.
+
+If you're not sure which group/Function App was created, list them:
 
 ```powershell
-$rg = 'rg-sla-monitoring'
-$storageAccount = '<output: storageAccount>'
+# All resource groups holding an SLA Function App
+az functionapp list --query "[?starts_with(name,'func-sla')].{name:name, rg:resourceGroup}" -o table
+```
+
+Then set the variables from that output (and the deployment outputs):
+
+```powershell
+$rg = '<your resource group>'                  # e.g. rg-sla-monitoring or rg-slareport08
 $functionAppName = az functionapp list -g $rg --query "[0].name" -o tsv
-$functionPrincipalId = '<output: functionAppPrincipalId>'
+$storageAccount  = az storage account list -g $rg --query "[0].name" -o tsv
+$functionPrincipalId = az functionapp identity show -g $rg -n $functionAppName --query principalId -o tsv
+
+# Sanity check — all three should print a value
+$rg; $functionAppName; $storageAccount; $functionPrincipalId
 ```
 
 ### Step 1 — Enable static website hosting
