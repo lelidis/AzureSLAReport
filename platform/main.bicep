@@ -73,6 +73,20 @@ resource storage 'Microsoft.Storage/storageAccounts@2023-05-01' = {
 // Bicep cannot toggle the static-website feature directly; use the deploy script below.
 
 // ---------------------------------------------------------------------------
+// Application Insights (workspace-based) for function invocation telemetry
+// ---------------------------------------------------------------------------
+resource appInsights 'Microsoft.Insights/components@2020-02-02' = {
+  name: 'appi-sla-prod'
+  location: location
+  tags: tags
+  kind: 'web'
+  properties: {
+    Application_Type: 'web'
+    WorkspaceResourceId: workspace.id
+  }
+}
+
+// ---------------------------------------------------------------------------
 // App Service plan (Consumption / Y1) and PowerShell Function App
 // ---------------------------------------------------------------------------
 resource plan 'Microsoft.Web/serverfarms@2023-12-01' = {
@@ -103,6 +117,7 @@ resource func 'Microsoft.Web/sites@2023-12-01' = {
         { name: 'STORAGE_ACCOUNT',  value: storage.name }
         { name: 'STATIC_CONTAINER', value: '$web' }
         { name: 'MATRIX_MONTHS',    value: '12' }
+        { name: 'APPLICATIONINSIGHTS_CONNECTION_STRING', value: appInsights.properties.ConnectionString }
       ]
     }
   }
@@ -114,6 +129,11 @@ resource func 'Microsoft.Web/sites@2023-12-01' = {
 var roleLogAnalyticsReader = '73c42c96-874c-492b-b04d-ab87d138a893'
 var roleBlobDataContributor = 'ba92f5b4-2d11-453d-a403-e96b0029c9fe'
 var roleMonitoringReader   = '43d0d8ad-25c7-4714-9337-8ba259a9fe05'
+// Identity-based AzureWebJobsStorage (no connection string) requires the host
+// identity to have blob + queue + table data access, not just blob.
+var roleBlobDataOwner      = 'b7e6dc6d-f1e8-4753-8033-0f276bb0955b'
+var roleQueueDataContributor = '974c5e8b-45b9-4653-ba55-5f855dd0fb88'
+var roleTableDataContributor = '0a9a7e1f-b9d0-4cc4-a60d-0319b160aaa3'
 
 resource raLaReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   name: guid(workspace.id, func.id, roleLogAnalyticsReader)
@@ -132,6 +152,48 @@ resource raBlob 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
     principalId: func.identity.principalId
     principalType: 'ServicePrincipal'
     roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', roleBlobDataContributor)
+  }
+}
+
+// Host storage (AzureWebJobsStorage) uses the function identity. The PowerShell
+// host needs blob (owner), queue and table data access to start, otherwise the
+// runtime fails with "InternalServerError from host runtime".
+//
+// NOTE: The function also queries Azure Resource Graph (Search-AzGraph) to build
+// the resource inventory used for 100% uptime backfill. That requires the function
+// MI to have **Reader** on the subscription(s) being reported. Because this template
+// is resource-group scoped it cannot create a subscription-scoped assignment; grant
+// it out-of-band, e.g.:
+//   az role assignment create --assignee-object-id <func.identity.principalId> \
+//     --assignee-principal-type ServicePrincipal --role Reader \
+//     --scope /subscriptions/<subId>
+resource raBlobOwner 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(storage.id, func.id, roleBlobDataOwner)
+  scope: storage
+  properties: {
+    principalId: func.identity.principalId
+    principalType: 'ServicePrincipal'
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', roleBlobDataOwner)
+  }
+}
+
+resource raQueue 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(storage.id, func.id, roleQueueDataContributor)
+  scope: storage
+  properties: {
+    principalId: func.identity.principalId
+    principalType: 'ServicePrincipal'
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', roleQueueDataContributor)
+  }
+}
+
+resource raTable 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(storage.id, func.id, roleTableDataContributor)
+  scope: storage
+  properties: {
+    principalId: func.identity.principalId
+    principalType: 'ServicePrincipal'
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', roleTableDataContributor)
   }
 }
 

@@ -23,98 +23,108 @@ $matrixMonths   = if ($env:MATRIX_MONTHS) { [int]$env:MATRIX_MONTHS } else { 12 
 
 $now    = [datetime]::UtcNow
 $report = $now.AddMonths(-1).ToString('yyyy-MM')
-$wStart = [datetime]::ParseExact("$report-01", 'yyyy-MM-dd', $null)
-$wEnd   = $wStart.AddMonths(1)
+$reportStart = [datetime]::ParseExact("$report-01", 'yyyy-MM-dd', $null)
+$reportEnd   = $reportStart.AddMonths(1)
+$matrixStart = $reportStart.AddMonths(-($matrixMonths - 1))
+$matrixEndEx = $reportEnd
 
 Write-Host "Reporting month: $report"
 
 # -----------------------------------------------------------------------------
-# 1. Query Log Analytics
+# 1. Inventory from Azure Resource Graph (real region + full 100% backfill base)
 # -----------------------------------------------------------------------------
-$kqlPerResource = @"
-let _start = datetime('$($wStart.ToString('o'))');
-let _end   = datetime('$($wEnd.ToString('o'))');
-let _wsec  = toreal(datetime_diff('second', _end, _start));
-AzureActivity
-| where TimeGenerated between (_start .. _end + 1h)
-| where CategoryValue == 'ResourceHealth'
-| where tolower(ResourceId) has '/providers/microsoft.compute/virtualmachines/'
-    or tolower(ResourceId) has '/providers/microsoft.compute/virtualmachinescalesets/'
-| extend p = todynamic(Properties)
-| where tostring(p['reasonType']) != 'UserInitiated'
-| extend ResourceId  = tolower(ResourceId),
-            AvailState  = tostring(p['currentHealthStatus']),
-            OccuredTime = coalesce(todatetime(p['eventTimestamp']), todatetime(p['occuredTime']), TimeGenerated),
-            Region      = coalesce(tostring(p['resourceLocation']), tostring(p['location']), tostring(ResourceGroup), 'unknown')
-| order by ResourceId asc, OccuredTime asc
-| extend NextTimeRaw = next(OccuredTime)
-| extend NextTime = coalesce(NextTimeRaw, _end)
-| extend SegStart = iff(OccuredTime < _start, _start, OccuredTime),
-         SegEnd   = iff(NextTime  > _end,   _end,   NextTime)
-| where SegEnd > SegStart
-| extend SegSec = datetime_diff('second', SegEnd, SegStart), IsDown = AvailState != 'Available'
-| summarize DownSec = sumif(SegSec, IsDown), Region = any(Region) by ResourceId
-| extend AvailabilityPct = round(((_wsec - DownSec) / _wsec) * 100, 4),
-         UnavailableMinutes = round(DownSec / 60.0, 2)
-| project ResourceId, Region, AvailabilityPct, UnavailableMinutes
-"@
+$computeTypes = "'microsoft.compute/virtualmachines','microsoft.compute/virtualmachinescalesets'"
+$invQuery = "resources | where type in~ ($computeTypes) | project ResourceId = tolower(id), Region = tostring(location)"
+$inventory = [System.Collections.Generic.List[object]]::new()
+$skipToken = $null
+do {
+    if ($skipToken) { $page = Search-AzGraph -Query $invQuery -First 1000 -SkipToken $skipToken }
+    else            { $page = Search-AzGraph -Query $invQuery -First 1000 }
+    foreach ($r in $page) { $inventory.Add($r) }
+    $skipToken = $page.SkipToken
+} while ($skipToken)
+Write-Host "Inventory compute resources: $($inventory.Count)"
 
-$kqlMatrix = @"
+# -----------------------------------------------------------------------------
+# 2. Downtime seconds per resource per month from Log Analytics
+# -----------------------------------------------------------------------------
+$kqlDown = @"
+let MatrixStart = datetime('$($matrixStart.ToString('o'))');
+let MatrixEndExclusive = datetime('$($matrixEndEx.ToString('o'))');
 let n = $matrixMonths;
-let MatrixEnd   = startofmonth(datetime('$($now.ToString('o'))')) + 1d;
-let MatrixStart = startofmonth(datetime_add('month', -(n-1), MatrixEnd));
-AzureActivity
-| where TimeGenerated between (MatrixStart .. MatrixEnd)
+let evtraw = AzureActivity
+| where TimeGenerated between (MatrixStart .. MatrixEndExclusive)
 | where CategoryValue == 'ResourceHealth'
-| where tolower(ResourceId) has '/providers/microsoft.compute/virtualmachines/'
-    or tolower(ResourceId) has '/providers/microsoft.compute/virtualmachinescalesets/'
-| extend p = todynamic(Properties)
-| where tostring(p['reasonType']) != 'UserInitiated'
-| extend ResourceId  = tolower(ResourceId),
-            AvailState  = tostring(p['currentHealthStatus']),
-            OccuredTime = coalesce(todatetime(p['eventTimestamp']), todatetime(p['occuredTime']), TimeGenerated),
-            Region      = coalesce(tostring(p['resourceLocation']), tostring(p['location']), tostring(ResourceGroup), 'unknown')
-| order by ResourceId asc, OccuredTime asc
-| extend NextTimeRaw = next(OccuredTime)
-| extend NextTime = coalesce(NextTimeRaw, MatrixEnd)
-| mv-expand m = range(0, n-1) to typeof(int)
-| extend WStart = startofmonth(datetime_add('month', m - (n-1), MatrixEnd)),
-         WEnd   = startofmonth(datetime_add('month', m - (n-2), MatrixEnd))
-| extend SegStart = iff(OccuredTime < WStart, WStart, OccuredTime),
-         SegEnd   = iff(NextTime  > WEnd,   WEnd,   NextTime)
-| where SegEnd > SegStart and SegStart >= WStart
-| extend SegSec = datetime_diff('second', SegEnd, SegStart), IsDown = AvailState != 'Available',
-         WSec   = datetime_diff('second', WEnd, WStart),
-         Month  = format_datetime(WStart, 'yyyy-MM')
-| summarize DownSec = sumif(SegSec, IsDown), WindowSec = max(WSec) by Region, Month
-| extend AvailabilityPct = round(((WindowSec - DownSec) / WindowSec) * 100, 4)
-| project Region, Month, AvailabilityPct
+| extend ResourceId = tolower(coalesce(_ResourceId, ResourceId))
+| where ResourceId has '/providers/microsoft.compute/virtualmachines/' or ResourceId has '/providers/microsoft.compute/virtualmachinescalesets/'
+| extend Props = tostring(Properties), OpName = tolower(tostring(OperationNameValue))
+| extend ReasonType = tolower(tostring(extractjson('`$.reasonType', Props))), Cause = tolower(tostring(extractjson('`$.cause', Props)))
+| where ReasonType != 'userinitiated' and Cause != 'userinitiated'
+| where not(OpName has 'deallocate' or OpName has 'power off' or OpName has 'poweroff')
+| extend AvailState = tostring(extractjson('`$.currentHealthStatus', Props)), OccuredTime = coalesce(todatetime(extractjson('`$.eventTimestamp', Props)), todatetime(extractjson('`$.occuredTime', Props)), TimeGenerated)
+| project ResourceId, OccuredTime, AvailState
+| order by ResourceId asc, OccuredTime asc;
+evtraw
+| extend NextTime = coalesce(next(OccuredTime), MatrixEndExclusive)
+| mv-expand m = range(0, n - 1) to typeof(int)
+| extend WindowStart = startofmonth(datetime_add('month', m, MatrixStart)), WindowEnd = startofmonth(datetime_add('month', m + 1, MatrixStart))
+| extend SegStart = iff(OccuredTime < WindowStart, WindowStart, OccuredTime), SegEnd = iff(NextTime > WindowEnd, WindowEnd, NextTime)
+| where SegEnd > SegStart
+| extend IsDown = AvailState != 'Available', Month = format_datetime(WindowStart, 'yyyy-MM')
+| summarize DownSec = sumif(datetime_diff('second', SegEnd, SegStart), IsDown) by ResourceId, Month
 "@
 
-$perRes = (Invoke-AzOperationalInsightsQuery -WorkspaceId $workspaceId -Query $kqlPerResource).Results
-$matRaw = (Invoke-AzOperationalInsightsQuery -WorkspaceId $workspaceId -Query $kqlMatrix).Results
+$downRaw = (Invoke-AzOperationalInsightsQuery -WorkspaceId $workspaceId -Query $kqlDown).Results
+$downMap = @{}
+foreach ($d in $downRaw) { $downMap["$($d.ResourceId)|$($d.Month)"] = [double]$d.DownSec }
 
 # -----------------------------------------------------------------------------
-# 2. Build pivot for matrix (Region x Month)
+# 3. Per-resource table (reporting month) with 100% backfill from inventory
 # -----------------------------------------------------------------------------
-$months = ($matRaw | Select-Object -ExpandProperty Month -Unique | Sort-Object)
-$matrix = $matRaw | Group-Object Region | ForEach-Object {
-    $row = [ordered]@{ Region = $_.Name }
-    foreach ($mo in $months) {
-        $cell = $_.Group | Where-Object { $_.Month -eq $mo } | Select-Object -First 1
-        $row[$mo] = if ($cell) { [double]$cell.AvailabilityPct } else { $null }
+$monthSecOf = { param($mo) $s = [datetime]::ParseExact("$mo-01", 'yyyy-MM-dd', $null); ($s.AddMonths(1) - $s).TotalSeconds }
+$reportSec  = & $monthSecOf $report
+
+$perRes = foreach ($inv in $inventory) {
+    $down = [double]0
+    $k = "$($inv.ResourceId)|$report"
+    if ($downMap.ContainsKey($k)) { $down = [math]::Min($downMap[$k], $reportSec) }
+    [pscustomobject]@{
+        ResourceId         = $inv.ResourceId
+        Region             = $inv.Region
+        AvailabilityPct    = [math]::Round((($reportSec - $down) / $reportSec) * 100, 4)
+        UnavailableMinutes = [math]::Round($down / 60.0, 2)
+    }
+}
+
+# -----------------------------------------------------------------------------
+# 4. Region x Month matrix with 100% backfill (weighted by inventory)
+# -----------------------------------------------------------------------------
+$monthsList = 0..($matrixMonths - 1) | ForEach-Object { $matrixStart.AddMonths($_).ToString('yyyy-MM') }
+$regions    = $inventory | Select-Object -ExpandProperty Region -Unique | Sort-Object
+$matrix = foreach ($rg in $regions) {
+    $resInRegion = @($inventory | Where-Object { $_.Region -eq $rg })
+    $row = [ordered]@{ Region = $rg }
+    foreach ($mo in $monthsList) {
+        $monthSec = & $monthSecOf $mo
+        $totalSec = $resInRegion.Count * $monthSec
+        $downSum  = [double]0
+        foreach ($r in $resInRegion) {
+            $k = "$($r.ResourceId)|$mo"
+            if ($downMap.ContainsKey($k)) { $downSum += [math]::Min($downMap[$k], $monthSec) }
+        }
+        $row[$mo] = if ($totalSec -gt 0) { [math]::Round((($totalSec - $downSum) / $totalSec) * 100, 4) } else { $null }
     }
     [pscustomobject]$row
 }
 
 # -----------------------------------------------------------------------------
-# 3. Render HTML
+# 5. Render HTML
 # -----------------------------------------------------------------------------
 $style = '<style>body{font-family:Segoe UI,Arial;margin:24px}table{border-collapse:collapse;width:100%;font-size:13px;margin:8px 0}th,td{border:1px solid #ddd;padding:6px 8px}th{background:#0a3a6b;color:#fff;text-align:center}.matrix td{text-align:center}.matrix td.region{text-align:left;font-weight:600;background:#fafafa}.matrix td.warn{background:#fff4ce}.matrix td.bad{background:#fde7e9}</style>'
 
-$mHead = '<tr><th>Region</th>' + (($months | ForEach-Object { "<th>$([datetime]::ParseExact("$_-01",'yyyy-MM-dd',$null).ToString('MMM-yy'))<br/>COMPUTE</th>" }) -join '') + '</tr>'
+$mHead = '<tr><th>Region</th>' + (($monthsList | ForEach-Object { "<th>$([datetime]::ParseExact("$_-01",'yyyy-MM-dd',$null).ToString('MMM-yy'))<br/>COMPUTE</th>" }) -join '') + '</tr>'
 $mBody = ($matrix | ForEach-Object {
-    $r = $_; $cells = foreach ($mo in $months) {
+    $r = $_; $cells = foreach ($mo in $monthsList) {
         $v = $r.$mo
         if ($null -eq $v) { "<td>n/a</td>" }
         else {
@@ -141,7 +151,7 @@ $html = @"
 "@
 
 # -----------------------------------------------------------------------------
-# 4. Upload to $web
+# 6. Upload to $web
 # -----------------------------------------------------------------------------
 $tmp = $env:TEMP
 $htmlFile  = Join-Path $tmp "AzComputeSla_$report.html"
