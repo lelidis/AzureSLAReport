@@ -166,7 +166,13 @@ The public report URL is then `https://<storageAccount>.z6.web.core.windows.net/
 
 ### Step 2 — Deploy the Function code
 
-The template deploys the empty Function App; publish the PowerShell code (`run.ps1`, `function.json`, `host.json`, `profile.ps1`, `requirements.psd1`) with a zip push. Build the archive so `host.json` sits at the **root** of the zip:
+The template deploys the empty Function App; publish the PowerShell code (`run.ps1`, `function.json`, `host.json`, `profile.ps1`, `requirements.psd1`) with a zip push. Build the archive so `host.json` sits at the **root** of the zip.
+
+> **Run these from the repo root** (the folder containing `platform/`). The `./platform/...` paths are relative, so if you're elsewhere you'll get `path '...\platform' either does not exist or is not a valid file system path`. `cd` into your clone first:
+>
+> ```powershell
+> cd <path-to-your-clone>   # e.g. C:\Users\<you>\Desktop\AzureSlaReport
+> ```
 
 ```powershell
 Compress-Archive -Path ./platform/function/* -DestinationPath ./platform/function-deploy.zip -Force
