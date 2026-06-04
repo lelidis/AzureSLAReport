@@ -122,10 +122,20 @@ The template (button, ARM, or Bicep) provisions the infrastructure but does **no
 
 > **Set `$rg` to the resource group you actually deployed into.** `rg-sla-monitoring` is only an example. With the portal button (Option A) you pick or create the RG in the form, so it may be anything (e.g. `rg-slareport08`). With Options B/C it's the name you passed to `az group create`. If you set the wrong name here, the next commands fail with `ResourceGroupNotFound` even though a group exists — the name simply doesn't match.
 
-If you're not sure which group/Function App was created, list them:
+> **Make sure the CLI is pointed at the subscription you deployed into.** The portal shows resources across *all* your subscriptions, but `az` only operates on the **active** one. If you deployed via the button into a different subscription, `az functionapp list -g <rg>` returns `ResourceGroupNotFound` (or shows a *previous* deployment) until you switch context:
+>
+> ```powershell
+> az account set --subscription <subscriptionId-or-name>
+> az account show --query "{name:name, id:id}" -o table   # confirm
+> ```
+
+If you're not sure which subscription/group/Function App was created, list across every subscription you can see:
 
 ```powershell
-# All resource groups holding an SLA Function App
+# Every SLA Function App in every subscription you have access to
+az graph query -q "resources | where type =~ 'microsoft.web/sites' and name startswith 'func-sla' | project name, resourceGroup, subscriptionId" -o table
+
+# (fallback if the resource-graph CLI extension isn't installed)
 az functionapp list --query "[?starts_with(name,'func-sla')].{name:name, rg:resourceGroup}" -o table
 ```
 
