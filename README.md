@@ -219,13 +219,21 @@ Then open `https://$storageAccount.z6.web.core.windows.net/` — the page shows 
 
 Run for each subscription you want included in the report. `readerPrincipalId` is the identity that opens the workbook (a user, group, or the `functionAppPrincipalId` for unattended use).
 
-The portal currently does not support subscription-scope deployments through "Deploy to Azure" buttons, so use the CLI for this step:
+The portal currently does not support subscription-scope deployments through "Deploy to Azure" buttons, so use the CLI for this step.
+
+Common setup for both options below:
 
 ```powershell
 $workspaceId = '<output from step 1: workspaceId>'
-$readerPrincipalId = '<objectId of user/group/SP>'
+$readerPrincipalId = '<objectId of user/group/SP>'   # or $functionPrincipalId for unattended use
 $location = 'westeurope'
+```
 
+### Option 1 — Specific subscriptions
+
+List only the subscriptions you want to monitor:
+
+```powershell
 $subs = @(
   '00000000-0000-0000-0000-000000000000',
   '11111111-1111-1111-1111-111111111111'
@@ -241,6 +249,32 @@ foreach ($sub in $subs) {
                  principalType=ServicePrincipal
 }
 ```
+
+### Option 2 — All existing subscriptions
+
+Enumerate every enabled subscription you have access to and enroll them all. This also auto-includes any subscription added later when you re-run it:
+
+```powershell
+# All enabled subscriptions in the current tenant you can access
+$subs = az account list --query "[?state=='Enabled'].id" -o tsv
+
+foreach ($sub in $subs) {
+  Write-Host "Enrolling subscription $sub ..."
+  az account set --subscription $sub
+  az deployment sub create `
+    --name sla-activity-export `
+    --location $location `
+    --template-file ./platform/activity-export.bicep `
+    --parameters workspaceResourceId=$workspaceId `
+                 readerPrincipalId=$readerPrincipalId `
+                 principalType=ServicePrincipal
+}
+```
+
+> Notes:
+> - `az account list` only returns subscriptions in tenants you're signed into. For multi-tenant, sign in per tenant (`az login --tenant <tenantId>`) and re-run.
+> - You need permission to deploy at subscription scope (Owner or Contributor + User Access Administrator) in **each** subscription; any you lack rights on will error and can be skipped.
+> - To also pull subscriptions across tenants/management groups in one shot, use `az account management-group` enumeration or the Azure Policy pattern in "Multi-subscription / multi-tenant patterns" below for hands-off auto-enrollment of future subscriptions.
 
 For users/groups, set `principalType=User` or `principalType=Group`.
 
