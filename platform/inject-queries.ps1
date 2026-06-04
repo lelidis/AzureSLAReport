@@ -80,8 +80,8 @@ $shell = @"
       "content": {
         "version": "KqlParameterItem/1.0",
         "parameters": [
-          { "id": "p_date", "version": "KqlParameterItem/1.0", "name": "Date", "label": "Date range", "type": 4, "isRequired": true, "value": "P7D", "description": "Choose a period", "timeRangeDefinition": "generic" },
-          { "id": "p_rtype", "version": "KqlParameterItem/1.0", "name": "ResourceTypes", "label": "Resource types", "type": 2, "isRequired": true, "multiSelect": true, "quote": "'", "delimiter": ",", "value": ["vm","vmss"], "query": "PARAM_QUERY", "queryType": 0, "resourceType": "microsoft.operationalinsights/workspaces" },
+          { "id": "p_date", "version": "KqlParameterItem/1.0", "name": "Date", "label": "Date range", "type": 4, "isRequired": true, "typeSettings": { "selectableValues": [ { "durationMs": 2592000000 }, { "durationMs": 5184000000 }, { "durationMs": 7776000000 }, { "durationMs": 15552000000 }, { "durationMs": 31536000000 } ], "additionalResourceOptions": [] }, "value": { "durationMs": 7776000000 }, "description": "Choose a period", "timeRangeDefinition": "generic" },
+          { "id": "p_rtype", "version": "KqlParameterItem/1.0", "name": "ResourceTypes", "label": "Resource types", "type": 2, "isRequired": true, "multiSelect": true, "quote": "'", "delimiter": ",", "value": [ALL_CODES_DEFAULT], "query": "PARAM_QUERY", "queryType": 0, "resourceType": "microsoft.operationalinsights/workspaces" },
           { "id": "p_include", "version": "KqlParameterItem/1.0", "name": "IncludeUserInitiated", "label": "Include user actions", "type": 2, "isRequired": true, "multiSelect": false, "quote": "'", "delimiter": ",", "value": ["false"], "query": "datatable(v:string) [\"false\",\"true\"] | project v", "queryType": 0, "resourceType": "microsoft.operationalinsights/workspaces" }
         ],
         "style": "pills",
@@ -126,7 +126,12 @@ $qRegion = $prelude + @"
 let MatrixStart = startofmonth(_start);
 let MatrixEndExclusive = startofmonth(datetime_add('month', 1, _end));
 let MonthCount = datetime_diff('month', MatrixEndExclusive, MatrixStart);
-let src = AzureActivity
+let months = range m from 0 to MonthCount - 1 step 1
+| extend WindowStart = startofmonth(datetime_add('month', m, MatrixStart)), WindowEnd = startofmonth(datetime_add('month', m + 1, MatrixStart))
+| extend ClipStart = iff(WindowStart < _start, _start, WindowStart), ClipEnd = iff(WindowEnd > _end, _end, WindowEnd)
+| where ClipEnd > ClipStart
+| extend Month = format_datetime(WindowStart, 'yyyy-MM'), WindowSec = datetime_diff('second', ClipEnd, ClipStart), dummy = 1;
+let evtraw = AzureActivity
 | where TimeGenerated between (_start .. _end)
 | where CategoryValue == 'ResourceHealth'
 | extend ResourceId = tolower(coalesce(_ResourceId, ResourceId))
@@ -135,19 +140,32 @@ let src = AzureActivity
 | extend ReasonType = tolower(tostring(extractjson('`$.reasonType', Props))), Cause = tolower(tostring(extractjson('`$.cause', Props)))
 | where ReasonType != 'userinitiated' and Cause != 'userinitiated'
 | where not(OpName has 'deallocate' or OpName has 'power off' or OpName has 'poweroff')
-| extend AvailState = tostring(extractjson('`$.currentHealthStatus', Props)), OccuredTime = coalesce(todatetime(extractjson('`$.eventTimestamp', Props)), todatetime(extractjson('`$.occuredTime', Props)), TimeGenerated), Region = coalesce(tostring(extractjson('`$.resourceLocation', Props)), tostring(extractjson('`$.location', Props)), tostring(ResourceGroup), 'unknown')
+| extend AvailState = tostring(extractjson('`$.currentHealthStatus', Props)), OccuredTime = coalesce(todatetime(extractjson('`$.eventTimestamp', Props)), todatetime(extractjson('`$.occuredTime', Props)), TimeGenerated)
+| project ResourceId, OccuredTime, AvailState
 | order by ResourceId asc, OccuredTime asc;
-src
-| extend NextTimeRaw = next(OccuredTime)
-| extend NextTime = coalesce(NextTimeRaw, _end)
+let downByMonth = evtraw
+| extend NextTime = coalesce(next(OccuredTime), _end)
 | mv-expand m = range(0, MonthCount - 1) to typeof(int)
 | extend WindowStart = startofmonth(datetime_add('month', m, MatrixStart)), WindowEnd = startofmonth(datetime_add('month', m + 1, MatrixStart))
 | extend SegStart = iff(OccuredTime < WindowStart, WindowStart, OccuredTime), SegEnd = iff(NextTime > WindowEnd, WindowEnd, NextTime)
-| where SegEnd > SegStart and SegStart < _end and SegEnd > _start
-| extend SegSec = datetime_diff('second', SegEnd, SegStart), IsDown = AvailState != 'Available', WindowSec = datetime_diff('second', iff(WindowEnd > _end, _end, WindowEnd), iff(WindowStart < _start, _start, WindowStart)), Month = format_datetime(WindowStart, 'yyyy-MM')
-| where WindowSec > 0
-| summarize DownSec = sumif(SegSec, IsDown), WindowSec = max(WindowSec) by Region, Month
-| extend SLA = round(((WindowSec - DownSec) * 100.0) / WindowSec, 4)
+| extend SegStart = iff(SegStart < _start, _start, SegStart), SegEnd = iff(SegEnd > _end, _end, SegEnd)
+| where SegEnd > SegStart
+| extend IsDown = AvailState != 'Available', Month = format_datetime(WindowStart, 'yyyy-MM')
+| summarize DownSec = sumif(datetime_diff('second', SegEnd, SegStart), IsDown) by ResourceId, Month;
+months
+| join kind=inner hint.remote=left (
+    arg('').resources
+    | where tolower(type) in (SelectedArgTypes)
+    | project ResourceId = tolower(id), Region = tostring(location)
+    | extend dummy = 1
+  ) on dummy
+| project ResourceId, Region, Month, WindowSec
+| join kind=leftouter downByMonth on ResourceId, Month
+| extend DownSec = coalesce(DownSec, tolong(0))
+| extend DownSec = iff(DownSec > WindowSec, WindowSec, DownSec)
+| summarize DownSec = sum(DownSec), TotalSec = sum(WindowSec) by Region, Month
+| where TotalSec > 0
+| extend SLA = round(((TotalSec - DownSec) * 100.0) / TotalSec, 4)
 | project Region, Month, SLA
 | evaluate pivot(Month, max(SLA))
 "@
@@ -215,6 +233,8 @@ function ToJsonStr([string]$s) {
 $p = 'C:\Users\nilelidi\Desktop\AzureSlaReport\platform\workbook-compute-sla.json'
 Set-Content -Path $p -Value $shell -Encoding utf8
 $c = Get-Content -Raw -Path $p
+$allCodes = ($services | ForEach-Object { '"{0}"' -f $_.code }) -join ','
+$c = $c.Replace('ALL_CODES_DEFAULT', $allCodes)
 $c = $c.Replace('PARAM_QUERY',     (ToJsonStr $paramQuery))
 $c = $c.Replace('QQ_REGION_MONTH', (ToJsonStr $qRegion))
 $c = $c.Replace('QQ_RESOURCE',     (ToJsonStr $qResource))
