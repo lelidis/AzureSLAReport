@@ -8,7 +8,9 @@
 #     (ResourceId, RType, Region, ActualSLA, ExpectedSLA, SlaBasis,
 #      UnavailableMinutes, PlatformEvents)
 #   - Region x Month (12-month) availability matrix, 100% backfilled
-# Renders HTML/CSV and uploads to the Storage account's `$web` static website.
+# Renders HTML/CSV and uploads them to a PRIVATE blob container (no public
+# static website). Authorized users read them via the Azure Portal Storage
+# browser / Storage Explorer with Storage Blob Data Reader over a private endpoint.
 #
 # Query semantics mirror the workbook exactly:
 #   - AzureActivity / CategoryValue == 'ResourceHealth'
@@ -19,7 +21,7 @@
 # App settings consumed (set in main.bicep):
 #   WORKSPACE_ID      - Log Analytics customerId (GUID)
 #   STORAGE_ACCOUNT   - Storage account name
-#   STATIC_CONTAINER  - usually `$web`
+#   REPORTS_CONTAINER - private blob container for reports (default 'reports')
 #   MATRIX_MONTHS     - default 12
 # =============================================================================
 param($Timer)
@@ -27,7 +29,7 @@ param($Timer)
 $ErrorActionPreference = 'Stop'
 $workspaceId    = $env:WORKSPACE_ID
 $storageAccount = $env:STORAGE_ACCOUNT
-$container      = if ($env:STATIC_CONTAINER) { $env:STATIC_CONTAINER } else { '$web' }
+$container      = if ($env:REPORTS_CONTAINER) { $env:REPORTS_CONTAINER } else { 'reports' }
 $matrixMonths   = if ($env:MATRIX_MONTHS) { [int]$env:MATRIX_MONTHS } else { 12 }
 
 $now    = [datetime]::UtcNow
@@ -268,7 +270,7 @@ $html = @"
 "@
 
 # -----------------------------------------------------------------------------
-# 7. Upload to `$web
+# 7. Upload to the PRIVATE reports container (Entra/RBAC, no keys, no $web)
 # -----------------------------------------------------------------------------
 $tmp = $env:TEMP
 $htmlFile  = Join-Path $tmp "AzSla_$report.html"
@@ -289,4 +291,4 @@ foreach ($f in @($htmlFile, $csvFile, $matrixCsv, $indexFile)) {
         -Properties @{ContentType=$ct} -Force | Out-Null
 }
 
-Write-Host "Report published to https://$storageAccount.z6.web.core.windows.net/"
+Write-Host "Report published to private container '$container' on storage '$storageAccount' (index.html). Read it via the Azure Portal Storage browser or Storage Explorer with Storage Blob Data Reader."

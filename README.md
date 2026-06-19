@@ -5,12 +5,14 @@
 
 Self-service Azure Workbook + Bicep platform that produces platform-availability SLA reports across many Azure services from `AzureActivity` Resource Health events, enriched with an Azure Resource Graph (ARG) inventory so even 100%-healthy resources appear.
 
+> **This branch (`enterprise-private`) is the private, no-public-ingress build.** Storage public access and the public `$web` static website are removed; the Function App, Log Analytics workspace, App Insights and Storage are reached only through private endpoints inside a dedicated VNet (Azure Monitor Private Link Scope for the monitoring data). Reports land in a **private blob container** read via Entra ID / RBAC. The one-click "Deploy to Azure" button and `armviz` badges above target the **public** `main` branch and are **not** the path for this architecture — deploy it from the CLI/CI with network line-of-sight to the private endpoints (corporate ExpressRoute/VPN). The Function still needs **outbound** egress to `management.azure.com` (Azure Resource Graph) and `login.microsoftonline.com` (Entra token); neither has Private Link, so allow them via your NAT gateway/firewall.
+
 ## What it provides
 
 Two consumer surfaces, fed by the same `AzureActivity` data and the same 49-service catalog:
 
 1. **Interactive Azure Workbook** (live, RBAC-gated, ad-hoc filtering).
-2. **Static monthly report** — a timer-triggered Function App renders the same tables to HTML/CSV and publishes them to the storage account's `$web` static website (no Azure sign-in needed to read).
+2. **Private monthly report** — a timer-triggered Function App renders the same tables to HTML/CSV and writes them to a **private blob container**. Authorized users read them via the Azure Portal Storage browser or Azure Storage Explorer with **`Storage Blob Data Reader`** over the private endpoint (Azure sign-in + RBAC required).
 
 Both surfaces show:
 
@@ -23,14 +25,17 @@ The workbook strictly excludes user-initiated actions from SLA math (uses `reaso
 
 ## Architecture
 
-- [platform/main.bicep](platform/main.bicep) — Resource group scope. Deploys:
-  - Log Analytics workspace (400-day retention by default)
-  - Storage account (hosts the `$web` static website for the monthly report)
-  - Application Insights (workspace-based) for Function invocation telemetry
-  - Function App (PowerShell 7.4, timer-triggered: `0 0 6 1 * *`, 1st of month 06:00 UTC) + Consumption (Y1) plan
+- [platform/main.bicep](platform/main.bicep) — Resource group scope. Deploys (all private):
+  - Log Analytics workspace (400-day retention by default; public ingestion + query **Disabled**)
+  - Application Insights (workspace-based; public access **Disabled**) for Function invocation telemetry
+  - Azure Monitor Private Link Scope (**AMPLS**, `PrivateOnly`) scoping the workspace + App Insights
+  - Storage account (`publicNetworkAccess=Disabled`, no static website) with a **private `reports` container** for the monthly output
+  - VNet `vnet-sla` with a private-endpoint subnet and a subnet delegated to the plan for Function regional VNet integration
+  - Private endpoints + private DNS zones for storage (blob/file/queue/table), the Function (`sites`), and AMPLS (`azuremonitor`)
+  - Function App (PowerShell 7.4, timer-triggered: `0 0 6 1 * *`, 1st of month 06:00 UTC) on an **Elastic Premium (EP1)** plan with VNet integration, public access **Disabled**, and SCM/FTP basic auth **Disabled**
   - RBAC for the Function managed identity: `Log Analytics Reader` on the workspace, plus `Storage Blob Data Contributor`, `Storage Blob Data Owner`, `Storage Queue Data Contributor` and `Storage Table Data Contributor` on the storage account (the last three are required because the host uses identity-based `AzureWebJobsStorage`)
   - Azure Workbook (queries injected from `workbook-compute-sla.json`)
-- [platform/function/](platform/function/) — PowerShell Function App code. `GenerateSlaReport/run.ps1` builds the ARG inventory, computes per-resource and region×month availability, and uploads HTML/CSV to `$web`. Deployed separately from the template (see step 2 of "After the hub template deploys").
+- [platform/function/](platform/function/) — PowerShell Function App code. `GenerateSlaReport/run.ps1` builds the ARG inventory, computes per-resource and region×month availability, and writes HTML/CSV to the private `reports` container via managed identity. Deployed separately from the template (see step 2 of "After the hub template deploys").
 - [platform/activity-export.bicep](platform/activity-export.bicep) — **Subscription scope.** Deploys per monitored subscription:
   - Activity Log diagnostic setting → workspace (`ResourceHealth` + `Administrative`)
   - `Reader` role assignment for the SLA report identity (so ARG inventory works)
@@ -41,6 +46,8 @@ The workbook JSON contains a placeholder `__WORKSPACE_RESOURCE_ID__` that Bicep 
 ## Prerequisites
 
 - Azure CLI 2.55+ with Bicep (`az bicep install`).
+- **Network line-of-sight to the private endpoints** for anyone deploying the Function code, reading the report, or opening the workbook (run from a host on the VNet, or via ExpressRoute/VPN/peering that can reach `vnet-sla`). The default `10.50.0.0/24` address space must not overlap your existing networks — override `vnetAddressPrefix`/`privateEndpointSubnetPrefix`/`functionSubnetPrefix` if it does.
+- **Outbound egress** from the Function subnet to `management.azure.com` and `login.microsoftonline.com` (ARG + Entra token have no Private Link). Provide it via a NAT gateway or allow these FQDNs through your firewall.
 - Permission to deploy at:
   - Resource group scope in the “hub” subscription that hosts the workspace and workbook.
   - Subscription scope in every subscription you want monitored (Owner or User Access Administrator + Monitoring Contributor).
@@ -48,6 +55,8 @@ The workbook JSON contains a placeholder `__WORKSPACE_RESOURCE_ID__` that Bicep 
 - **The Function App's managed identity also needs `Reader` on every subscription it reports on** — it calls Azure Resource Graph (`Search-AzGraph`) to inventory resources for the 100% backfill. Because `main.bicep` is resource-group scoped it cannot create this subscription-level assignment; grant it after the hub deploys (step 3 below). The simplest path is to pass the Function's `functionAppPrincipalId` as the `readerPrincipalId` to `activity-export.bicep`, which covers both the workbook reader and the Function in one assignment.
 
 ## Deployment
+
+> On this `enterprise-private` branch, prefer **Option B (ARM JSON)** or **Option C (Bicep)** from a host with line-of-sight to the target VNet. The portal **Option A** button can still *create* the resources, but everything it deploys is private — you will need VNet connectivity (and the post-deploy steps) before you can publish code or read a report.
 
 You can deploy the hub three ways. Pick whichever fits your audience; all three produce the same resources.
 
@@ -114,11 +123,16 @@ Outputs include:
 - `workspaceId` — full LAW resource id
 - `functionAppPrincipalId` — managed identity object id used by SLA exports
 - `storageAccount` — name of the storage account hosting the report
+- `reportsContainer` — the private blob container the report is written to
+- `reportBlobPathHint` — how to read the private report
+- `vnetId` — the VNet hosting the private endpoints
 - `workbookResourceId` — open this in the portal
 
 ## After the hub template deploys (required for all options)
 
-The template (button, ARM, or Bicep) provisions the infrastructure but does **not** turn on the static website, push the Function code, or grant the Function the subscription access it needs for the inventory. Run these three steps once after any of Option A/B/C.
+The template provisions the infrastructure but does **not** push the Function code, grant report readers their RBAC, or grant the Function the subscription access it needs for the inventory. Run these steps once after deploying.
+
+> **All of the steps below must run from a host with network line-of-sight to `vnet-sla`'s private endpoints** (a VM/agent on the VNet, or your workstation over ExpressRoute/VPN). Because the Function App, storage and workspace have public access disabled, commands that touch their data/SCM planes from the public internet will fail.
 
 > **Set `$rg` to the resource group you actually deployed into.** `rg-sla-monitoring` is only an example. With the portal button (Option A) you pick or create the RG in the form, so it may be anything (e.g. `rg-slareport08`). With Options B/C it's the name you passed to `az group create`. If you set the wrong name here, the next commands fail with `ResourceGroupNotFound` even though a group exists — the name simply doesn't match.
 
@@ -151,22 +165,24 @@ $functionPrincipalId = az functionapp identity show -g $rg -n $functionAppName -
 $rg; $functionAppName; $storageAccount; $functionPrincipalId
 ```
 
-### Step 1 — Enable static website hosting
+### Step 1 — Grant report readers `Storage Blob Data Reader`
 
-Bicep cannot toggle the static-website feature, so enable it once:
+There is no public website. People read the report from the private `reports` container, which requires a data-plane role. Grant it to the user/group that should see reports:
 
 ```powershell
-az storage blob service-properties update `
-  --account-name $storageAccount `
-  --static-website --index-document index.html `
-  --auth-mode login
+$readerObjectId = az ad signed-in-user show --query id -o tsv   # or a group/user objectId
+$storageId = az storage account show -g $rg -n $storageAccount --query id -o tsv
+
+az role assignment create `
+  --assignee-object-id $readerObjectId `
+  --assignee-principal-type User `
+  --role "Storage Blob Data Reader" `
+  --scope $storageId
 ```
 
-The public report URL is then `https://<storageAccount>.z6.web.core.windows.net/`.
+### Step 2 — Deploy the Function code (private)
 
-### Step 2 — Deploy the Function code
-
-The template deploys the empty Function App; publish the PowerShell code (`run.ps1`, `function.json`, `host.json`, `profile.ps1`, `requirements.psd1`) with a zip push. Build the archive so `host.json` sits at the **root** of the zip.
+The template deploys the empty Function App. Because public access and SCM basic auth are disabled, publish the PowerShell code (`run.ps1`, `function.json`, `host.json`, `profile.ps1`, `requirements.psd1`) over the **private** plane. Build the archive so `host.json` sits at the **root** of the zip.
 
 > **Run these from the repo root** (the folder containing `platform/`). The `./platform/...` paths are relative, so if you're elsewhere you'll get `path '...\platform' either does not exist or is not a valid file system path`. `cd` into your clone first:
 >
@@ -176,19 +192,26 @@ The template deploys the empty Function App; publish the PowerShell code (`run.p
 
 ```powershell
 Compress-Archive -Path ./platform/function/* -DestinationPath ./platform/function-deploy.zip -Force
-
-az functionapp deployment source config-zip `
-  -g $rg -n $functionAppName --src ./platform/function-deploy.zip
 ```
 
-> If your tenant disables SCM basic auth (recommended), zip deploy needs it briefly. Enable it, deploy, then disable again:
-> ```powershell
-> az resource update -g $rg --namespace Microsoft.Web --parent sites/$functionAppName `
->   --resource-type basicPublishingCredentialsPolicies -n scm --set properties.allow=true -o none
-> # ... run the config-zip command above ...
-> az resource update -g $rg --namespace Microsoft.Web --parent sites/$functionAppName `
->   --resource-type basicPublishingCredentialsPolicies -n scm --set properties.allow=false -o none
-> ```
+**Recommended — Run From Package from the private container (no SCM, no keys).** Upload the zip to a private blob the Function MI can read, then point the app at it. The MI already has `Storage Blob Data Owner/Contributor` from the template.
+
+```powershell
+# Upload the package to a private 'deploy' container (created on first use)
+az storage container create --account-name $storageAccount -n deploy --auth-mode login -o none
+az storage blob upload --account-name $storageAccount -c deploy `
+  -n function-deploy.zip -f ./platform/function-deploy.zip --auth-mode login --overwrite -o none
+
+# Point the app at the package via its (private) blob endpoint and restart
+$pkgUrl = "https://$storageAccount.blob.$((az cloud show --query suffixes.storageEndpoint -o tsv))/deploy/function-deploy.zip"
+az functionapp config appsettings set -g $rg -n $functionAppName `
+  --settings WEBSITE_RUN_FROM_PACKAGE=$pkgUrl -o none
+az functionapp restart -g $rg -n $functionAppName
+```
+
+> The Function pulls the package over its VNet integration using its managed identity — no shared keys and nothing leaves the private network. Re-upload the blob and `restart` to ship updates.
+>
+> **Alternative:** run `az functionapp deployment source config-zip -g $rg -n $functionAppName --src ./platform/function-deploy.zip` from a build agent/jumpbox **on the VNet**; the SCM private endpoint accepts an Entra bearer token, so it works even with basic auth disabled.
 
 ### Step 3 — Grant the Function identity `Reader` on each reported subscription
 
@@ -207,13 +230,14 @@ az role assignment create `
 The Function runs automatically on the 1st of each month. To produce a report immediately:
 
 ```powershell
+# Run from a host on the VNet (the function endpoint is private):
 $key = az functionapp keys list -g $rg -n $functionAppName --query masterKey -o tsv
 Invoke-RestMethod -Method Post `
   -Uri "https://$functionAppName.azurewebsites.net/admin/functions/GenerateSlaReport" `
   -Headers @{ 'x-functions-key' = $key } -ContentType 'application/json' -Body '{}'
 ```
 
-Then open `https://$storageAccount.z6.web.core.windows.net/` — the page shows the `Generated` timestamp and the resource count.
+Then open the latest `index.html` from the private `reports` container (Portal → the storage account → **Storage browser** → **Blob containers** → `reports`, or Azure Storage Explorer) — the page shows the `Generated` timestamp and the resource count.
 
 ## Per-subscription enablement (applies to all deployment options)
 
@@ -286,10 +310,10 @@ For users/groups, set `principalType=User` or `principalType=Group`.
 - Pick `Date range`, one or more `Resource types`, and optionally enable `Include user actions`.
 - All visuals re-run automatically when filters change.
 
-**Static monthly report:**
+**Private monthly report:**
 
-- Open `https://<storageAccount>.z6.web.core.windows.net/` (refreshed on the 1st of each month, or on demand via Step 4 above).
-- `index.html` is the latest report; per-month `AzSla_<yyyy-MM>.html`, `AzSla_<yyyy-MM>.csv`, and `AzSla_RegionMatrix_<yyyy-MM>.csv` are also published.
+- In the Azure Portal, open the storage account → **Storage browser** → **Blob containers** → `reports` (or use Azure Storage Explorer). Requires `Storage Blob Data Reader` (Step 1) and network access to the private endpoint.
+- `index.html` is the latest report; per-month `AzSla_<yyyy-MM>.html`, `AzSla_<yyyy-MM>.csv`, and `AzSla_RegionMatrix_<yyyy-MM>.csv` are also written. Download an `.html` and open it locally, or preview it inline from the Storage browser.
 
 ## Verification
 
