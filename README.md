@@ -1,11 +1,13 @@
 # Azure Availability SLA Report
 
-[![Deploy to Azure](https://aka.ms/deploytoazurebutton)](https://portal.azure.com/#create/Microsoft.Template/uri/https%3A%2F%2Fraw.githubusercontent.com%2Flelidis%2FAzureSLAReport%2F608b261054df7abd8bc45fe8b70d47386c45b902%2Fplatform%2Fmain.json/createUIDefinitionUri/https%3A%2F%2Fraw.githubusercontent.com%2Flelidis%2FAzureSLAReport%2F608b261054df7abd8bc45fe8b70d47386c45b902%2Fplatform%2FcreateUiDefinition.json)
-[![Visualize](https://raw.githubusercontent.com/Azure/azure-quickstart-templates/master/1-CONTRIBUTION-GUIDE/images/visualizebutton.svg?sanitize=true)](https://armviz.io/#/?load=https%3A%2F%2Fraw.githubusercontent.com%2Flelidis%2FAzureSLAReport%2F608b261054df7abd8bc45fe8b70d47386c45b902%2Fplatform%2Fmain.json)
+[![Deploy to Azure](https://aka.ms/deploytoazurebutton)](https://portal.azure.com/#create/Microsoft.Template/uri/https%3A%2F%2Fraw.githubusercontent.com%2Flelidis%2FAzureSLAReport%2F508c937a6c9f44085010da59bb83be488711f253%2Fplatform%2Fmain.json/createUIDefinitionUri/https%3A%2F%2Fraw.githubusercontent.com%2Flelidis%2FAzureSLAReport%2F508c937a6c9f44085010da59bb83be488711f253%2Fplatform%2FcreateUiDefinition.json)
+[![Visualize](https://raw.githubusercontent.com/Azure/azure-quickstart-templates/master/1-CONTRIBUTION-GUIDE/images/visualizebutton.svg?sanitize=true)](https://armviz.io/#/?load=https%3A%2F%2Fraw.githubusercontent.com%2Flelidis%2FAzureSLAReport%2F508c937a6c9f44085010da59bb83be488711f253%2Fplatform%2Fmain.json)
 
 Self-service Azure Workbook + Bicep platform that produces platform-availability SLA reports across many Azure services from `AzureActivity` Resource Health events, enriched with an Azure Resource Graph (ARG) inventory so even 100%-healthy resources appear.
 
-> **This branch (`enterprise-private`) is the private, no-public-ingress build.** Storage public access and the public `$web` static website are removed; the Function App, Log Analytics workspace, App Insights and Storage are reached only through private endpoints inside a dedicated VNet (Azure Monitor Private Link Scope for the monitoring data). Reports land in a **private blob container** read via Entra ID / RBAC. The one-click "Deploy to Azure" button and `armviz` badges above target the **public** `main` branch and are **not** the path for this architecture — deploy it from the CLI/CI with network line-of-sight to the private endpoints (corporate ExpressRoute/VPN). The Function still needs **outbound** egress to `management.azure.com` (Azure Resource Graph) and `login.microsoftonline.com` (Entra token); neither has Private Link, so allow them via your NAT gateway/firewall.
+> **This branch (`enterprise-private`) is the private, no-public-ingress build.** Storage public access and the public `$web` static website are removed; the Function App, Log Analytics workspace, App Insights and Storage are reached only through private endpoints inside a dedicated VNet (Azure Monitor Private Link Scope for the monitoring data). Reports land in a **private blob container** read via Entra ID / RBAC.
+>
+> The badges above are pinned to this branch's reviewed template (commit `508c937`), so the **Deploy to Azure** button now provisions the *private* stack — but it only **creates the infrastructure**. Whichever deploy option you pick, you must then run the **post-deploy steps** ([After the hub template deploys](#after-the-hub-template-deploys-required-for-all-options)) from a host that can reach the new VNet's private endpoints (a VM/agent on the VNet, or your workstation over ExpressRoute/VPN). The Function also needs **outbound** egress to `management.azure.com` (Azure Resource Graph) and `login.microsoftonline.com` (Entra token); neither has Private Link, so allow them via your NAT gateway/firewall.
 
 ## What it provides
 
@@ -56,25 +58,35 @@ The workbook JSON contains a placeholder `__WORKSPACE_RESOURCE_ID__` that Bicep 
 
 ## Deployment
 
-> On this `enterprise-private` branch, prefer **Option B (ARM JSON)** or **Option C (Bicep)** from a host with line-of-sight to the target VNet. The portal **Option A** button can still *create* the resources, but everything it deploys is private — you will need VNet connectivity (and the post-deploy steps) before you can publish code or read a report.
+Every deployment of this branch follows the **same three phases**. The only choice is *how you create the infrastructure* in Phase 1; Phases 2 and 3 are identical and mandatory because the stack is private.
 
-You can deploy the hub three ways. Pick whichever fits your audience; all three produce the same resources.
+- **Phase 1 — Create the private infrastructure.** Pick **one** option: [Option A (portal button)](#option-a--deploy-to-azure-portal-form), [Option B (ARM JSON)](#option-b--arm-json-via-azure-cli), or [Option C (Bicep)](#option-c--bicep-source-of-truth). All three create the same resources; the deploy command itself is control-plane only and can run from anywhere.
+- **Phase 2 — Finish the setup** ([After the hub template deploys](#after-the-hub-template-deploys-required-for-all-options)). Steps 1–4: grant readers RBAC, deploy the Function code, grant the Function `Reader`, and optionally trigger a run. **Run these from a host with VNet access** — steps 1, 2 and 4 touch the private storage/Function planes.
+- **Phase 3 — Enroll subscriptions** ([Per-subscription enablement](#per-subscription-enablement-applies-to-all-deployment-options)). Turn on Activity Log export for each subscription you want reported.
+
+> **“VNet access”** means the machine running the command can reach `vnet-sla`'s private endpoints — a VM/build agent on that VNet, or your workstation over ExpressRoute/VPN/peering. The storage data plane and the Function SCM/admin plane are **not** reachable from the public internet on this branch.
+
+### Phase 1 — create the infrastructure (choose one option)
+
+All three options below create the **same private resources**. They differ only in tooling.
 
 | Option | Tooling needed | Best for |
 | --- | --- | --- |
-| Portal "Deploy to Azure" button | Browser only | One-click adoption, demos |
-| ARM JSON via Azure CLI | `az` | Users without Bicep installed |
-| Bicep via Azure CLI | `az` + Bicep | CI/CD, this repo's source of truth |
+| A — Portal “Deploy to Azure” button | Browser only | Quick provisioning; you still finish from a VNet-connected host |
+| B — ARM JSON via Azure CLI | `az` | Users without Bicep installed |
+| C — Bicep via Azure CLI | `az` + Bicep | CI/CD, this repo's source of truth |
 
 ### Option A — Deploy to Azure (portal form)
 
-Click the button at the top of this README, or use this direct link:
+Click the button at the top of this README, or use this direct link (pinned to this branch's reviewed commit):
 
-> https://portal.azure.com/#create/Microsoft.Template/uri/https%3A%2F%2Fraw.githubusercontent.com%2Flelidis%2FAzureSLAReport%2Fmain%2Fplatform%2Fmain.json/createUIDefinitionUri/https%3A%2F%2Fraw.githubusercontent.com%2Flelidis%2FAzureSLAReport%2Fmain%2Fplatform%2FcreateUiDefinition.json
+> https://portal.azure.com/#create/Microsoft.Template/uri/https%3A%2F%2Fraw.githubusercontent.com%2Flelidis%2FAzureSLAReport%2F508c937a6c9f44085010da59bb83be488711f253%2Fplatform%2Fmain.json/createUIDefinitionUri/https%3A%2F%2Fraw.githubusercontent.com%2Flelidis%2FAzureSLAReport%2F508c937a6c9f44085010da59bb83be488711f253%2Fplatform%2FcreateUiDefinition.json
 
-The portal will prompt for subscription, resource group, location, workspace name, storage account name, and (optional) Function App / plan names — no CLI required. The button references [platform/main.json](platform/main.json) and [platform/createUiDefinition.json](platform/createUiDefinition.json) over `raw.githubusercontent.com`, so the repo and those two files must be public.
+The form prompts for subscription, resource group, location, workspace name, storage account name, and (optional) Function App / plan names. The VNet, subnets, private endpoints, AMPLS and private DNS use the template defaults (`10.50.0.0/24` address space) — review the [Prerequisites](#prerequisites) if that range clashes with your network, and in that case use Option B/C so you can override `vnetAddressPrefix`/`privateEndpointSubnetPrefix`/`functionSubnetPrefix`.
 
-If you fork this repo, swap `lelidis/AzureSLAReport/main` in the URL above for `<owner>/<repo>/<branch>`.
+> The button only **creates** the (private) resources. You cannot read a report from the portal form — once it finishes, continue with Phase 2 from a host that can reach the VNet. The button references [platform/main.json](platform/main.json) and [platform/createUiDefinition.json](platform/createUiDefinition.json) over `raw.githubusercontent.com`, so the repo and those two files must remain public.
+
+If you fork this repo, swap `lelidis/AzureSLAReport/508c937a6c9f44085010da59bb83be488711f253` in the URL above for `<owner>/<repo>/<branch-or-commit>`.
 
 ### Option B — ARM JSON via Azure CLI
 
@@ -90,7 +102,7 @@ az deployment group create `
   --parameters workspaceName=law-sla-prod storageAccountName=stslareportprod
 ```
 
-If you change `main.bicep` or the workbook, recompile before deploying:
+The CLI deployment itself works from anywhere (it is control-plane only). You still need VNet access for the post-deploy steps. If you change `main.bicep` or the workbook, recompile before deploying:
 
 ```powershell
 az bicep build --file ./platform/main.bicep            --outfile ./platform/main.json
