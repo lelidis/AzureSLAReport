@@ -4,8 +4,8 @@
   "metadata": {
     "_generator": {
       "name": "bicep",
-      "version": "0.42.1.51946",
-      "templateHash": "531119157556582993"
+      "version": "0.45.15.27210",
+      "templateHash": "5298909018421530619"
     }
   },
   "parameters": {
@@ -18,7 +18,7 @@
     "readerPrincipalId": {
       "type": "string",
       "metadata": {
-        "description": "Object ID granted Reader on this subscription (for ARG inventory in the workbook)."
+        "description": "Object ID granted Reader on this subscription (the Function identity for the Azure Resource Graph inventory, and/or the workbook reader)."
       }
     },
     "principalType": {

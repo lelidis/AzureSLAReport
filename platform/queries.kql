@@ -42,11 +42,15 @@ let PerResource =
              UnavailableMin  = round(DownSec / 60.0, 2);
 PerResource
 | join kind=leftouter (
-    Resources                    // Resource Graph in LA via heartbeat? -> see note below
+    // Newest inventory snapshot, written daily by the RefreshInventory Function.
+    SlaInventory_CL
+    | where TimeGenerated == toscalar(SlaInventory_CL | summarize max(TimeGenerated))
+    | project ResourceId, RType, Region
   ) on ResourceId
 
-// NOTE: Resource Graph isn't in LA. Instead enrich via ARG join in the workbook,
-// or join with a watchlist refreshed by the Function App.
+// NOTE: arg("") cannot be used on a workspace reached through Azure Monitor Private Link
+// ("The Azure Data Explorer (ADX) pattern cannot be used with Private Link"), so the
+// resource inventory comes from the SlaInventory_CL table instead.
 
 // ----------------------------------------------------------------------------
 // 2. Region x Month uptime matrix (12 months)

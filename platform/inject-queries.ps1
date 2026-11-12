@@ -63,7 +63,6 @@ $argMapRows   = ($services | ForEach-Object { "'{0}','{1}'" -f (K-Esc $_.arg), (
 $expectedRows = ($services | ForEach-Object { "'{0}','{1}','{2}'" -f (K-Esc $_.RType), (K-Esc $_.sla), (K-Esc $_.basis) }) -join ",`n"
 
 $rtypeCase   = (($services | ForEach-Object { "ResourceId has '{0}', '{1}'" -f (K-Esc $_.token), (K-Esc $_.RType) }) -join ', ') + ", 'Other'"
-$argTypeCase = (($services | ForEach-Object { "tolower(type) == '{0}', '{1}'" -f (K-Esc $_.arg), (K-Esc $_.RType) }) -join ', ') + ", 'Other'"
 
 $shell = @"
 {
@@ -72,7 +71,7 @@ $shell = @"
     {
       "type": 1,
       "content": {
-        "json": "# Azure Availability SLA\nPlatform availability for selected Azure services over a chosen period.\n\n- Default view is platform unavailability only (excludes user-initiated actions)\n- Choose one or more resource types in the filter\n- Turn on Include user actions to also show user-triggered operations in event views\n\nData source: AzureActivity (ResourceHealth + Administrative) and Azure Resource Graph for inventory."
+        "json": "# Azure Availability SLA\nPlatform availability for selected Azure services over a chosen period.\n\n- Default view is platform unavailability only (excludes user-initiated actions)\n- Choose one or more resource types in the filter\n- Turn on Include user actions to also show user-triggered operations in event views\n\nData source: AzureActivity (ResourceHealth + Administrative) and the SlaInventory_CL table, a daily Azure Resource Graph snapshot written by the RefreshInventory Function (arg() cannot be used on a Private Link workspace)."
       }
     },
     {
@@ -122,7 +121,17 @@ let SelectedTokens = toscalar(TokenMap | where array_index_of(Types, code) >= 0 
 let SelectedArgTypes = toscalar(argTypeMap | join kind=inner (TokenMap | where array_index_of(Types, code) >= 0 | project RType) on RType | summarize make_list(argType));
 "@
 
-$qRegion = $prelude + @"
+# Inventory = newest snapshot of the SlaInventory_CL table (written daily by the RefreshInventory
+# Function from Azure Resource Graph). Plain Log Analytics table, so it works over Private Link.
+$inventoryLets = @"
+let InventorySnapshot = toscalar(SlaInventory_CL | where TimeGenerated > ago(30d) | summarize max(TimeGenerated));
+let inventory = SlaInventory_CL
+| where TimeGenerated == InventorySnapshot
+| where ArgType in (SelectedArgTypes)
+| project ResourceId, RType, Region;
+"@
+
+$qRegion = $prelude + $inventoryLets + @"
 let MatrixStart = startofmonth(_start);
 let MatrixEndExclusive = startofmonth(datetime_add('month', 1, _end));
 let MonthCount = datetime_diff('month', MatrixEndExclusive, MatrixStart);
@@ -153,10 +162,9 @@ let downByMonth = evtraw
 | extend IsDown = AvailState != 'Available', Month = format_datetime(WindowStart, 'yyyy-MM')
 | summarize DownSec = sumif(datetime_diff('second', SegEnd, SegStart), IsDown) by ResourceId, Month;
 months
-| join kind=inner hint.remote=left (
-    arg('').resources
-    | where tolower(type) in (SelectedArgTypes)
-    | project ResourceId = tolower(id), Region = tostring(location)
+| join kind=inner (
+    inventory
+    | project ResourceId, Region
     | extend dummy = 1
   ) on dummy
 | project ResourceId, Region, Month, WindowSec
@@ -170,14 +178,11 @@ months
 | evaluate pivot(Month, max(SLA))
 "@
 
-$qResource = $prelude + @"
+$qResource = $prelude + $inventoryLets + @"
 let WindowSec = toreal(datetime_diff('second', _end, _start));
 let expectedByType = datatable(RType:string, ExpectedSLA:string, SlaBasis:string)[
 $expectedRows
 ];
-let inventory = arg('').resources
-| where tolower(type) in (SelectedArgTypes)
-| project ResourceId = tolower(id), RType = tostring(case($argTypeCase)), Region = tostring(location);
 let src = AzureActivity
 | where TimeGenerated between (_start .. _end)
 | where CategoryValue == 'ResourceHealth'
@@ -196,8 +201,8 @@ src
 | where SegEnd > SegStart
 | extend SegSec = datetime_diff('second', SegEnd, SegStart), IsDown = AvailState != 'Available'
 | summarize DownSec = sumif(SegSec, IsDown), Region = any(Region), RType = any(RType), PlatformEvents = count() by ResourceId
-| join kind=fullouter hint.remote=left (inventory | project ResourceId, InvRType = RType, InvRegion = Region) on ResourceId
-| extend ResourceId = coalesce(ResourceId, ResourceId1), RType = coalesce(RType, InvRType, 'Other'), Region = coalesce(Region, InvRegion, 'unknown'), DownSec = coalesce(DownSec, tolong(0)), PlatformEvents = coalesce(PlatformEvents, tolong(0))
+| join kind=fullouter (inventory | project ResourceId, InvRType = RType, InvRegion = Region) on ResourceId
+| extend ResourceId = coalesce(ResourceId, ResourceId1), RType = coalesce(InvRType, RType, 'Other'), Region = coalesce(InvRegion, Region, 'unknown'), DownSec = coalesce(DownSec, tolong(0)), PlatformEvents = coalesce(PlatformEvents, tolong(0))
 | project-away ResourceId1, InvRType, InvRegion
 | join kind=leftouter expectedByType on RType
 | extend SLA = round(((WindowSec - todouble(DownSec)) * 100.0) / WindowSec, 4), UnavailableMinutes = round(todouble(DownSec) / 60.0, 2), ExpectedSLA = coalesce(ExpectedSLA, 'Unknown'), SlaBasis = coalesce(SlaBasis, 'Not mapped')
@@ -230,7 +235,7 @@ function ToJsonStr([string]$s) {
   return $j.Substring(1, $j.Length - 2)
 }
 
-$p = 'C:\Users\nilelidi\Desktop\AzureSlaReport\platform\workbook-compute-sla.json'
+$p = Join-Path $PSScriptRoot 'workbook-compute-sla.json'
 Set-Content -Path $p -Value $shell -Encoding utf8
 $c = Get-Content -Raw -Path $p
 $allCodes = ($services | ForEach-Object { '"{0}"' -f $_.code }) -join ','

@@ -6,7 +6,7 @@ The deployment guide is the [README](../README.md#deployment). This branch deplo
 
 ```
 platform/
-├─ main.bicep                       # RG scope: workspace, App Insights, AMPLS, VNet, private endpoints, storage, Flex Function, workbook
+├─ main.bicep                       # RG scope: workspace + inventory table, App Insights, AMPLS, DCE/DCR, VNet + NSG/NAT, private endpoints, storage, Flex Function, workbook
 ├─ activity-export.bicep            # subscription scope: Activity Log -> workspace, Reader for the report identity
 ├─ policy-resource-health.bicep     # optional management-group policy that enrolls subscriptions automatically
 ├─ inject-queries.ps1               # service catalog and workbook query generator
@@ -15,6 +15,10 @@ platform/
 ├─ Test-SlaPlatform.ps1             # post-deployment validation (run from a host on the VNet)
 └─ function/
    ├─ host.json
+   ├─ Shared/SlaCommon.ps1          # managed-identity REST helpers, 49-service catalog, Resource Graph inventory
+   ├─ RefreshInventory/             # 0 30 2 * * *  (daily 02:30 UTC): Resource Graph -> SlaInventory_CL
+   │  ├─ function.json
+   │  └─ run.ps1
    └─ GenerateSlaReport/
       ├─ function.json              # 0 0 6 1 * *  (1st of month, 06:00 UTC)
       └─ run.ps1
@@ -33,4 +37,4 @@ Both surfaces require a network path to the private endpoints (corporate VPN/Exp
 
 - Set a daily ingestion cap on the workspace (**Settings → Daily Cap**).
 - Create a Log Search alert on the per-resource KQL with `| where AvailabilityPct < 99.9` for SLA breaches.
-- The Function runs once a month on Flex Consumption and scales to zero; the private endpoints (storage blob/queue/table, Function, AMPLS) are the main fixed cost.
+- The Functions run on Flex Consumption and scale to zero; the fixed costs are the private endpoints (storage blob/queue/table, Function, AMPLS) and the NAT gateway used for the Azure Resource Graph call (`deployNatGateway=false` removes it if you provide that egress yourself).

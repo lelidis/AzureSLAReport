@@ -22,7 +22,7 @@ targetScope = 'subscription'
 @description('Full resource ID of the Log Analytics workspace receiving Activity Log.')
 param workspaceResourceId string
 
-@description('Object ID granted Reader on this subscription (for ARG inventory in the workbook).')
+@description('Object ID granted Reader on this subscription (the Function identity for the Azure Resource Graph inventory, and/or the workbook reader).')
 param readerPrincipalId string
 
 @description('Principal type for the role assignment.')

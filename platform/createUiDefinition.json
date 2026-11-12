@@ -41,6 +41,14 @@
           "validationMessage": "3-24 lowercase letters or digits."
         },
         "visible": true
+      },
+      {
+        "name": "deployNatGateway",
+        "type": "Microsoft.Common.CheckBox",
+        "label": "Create a NAT gateway for the Azure Resource Graph call",
+        "defaultValue": true,
+        "toolTip": "The Function reads the resource inventory from Azure Resource Graph through management.azure.com, which has no private endpoint. The NAT gateway (fixed hourly charge) is the only outbound path; an NSG blocks every other internet destination. Clear it only if you route egress through your own firewall or use ARM Private Link.",
+        "visible": true
       }
     ],
     "steps": [],
@@ -48,7 +56,8 @@
       "location": "[location()]",
       "workspaceName": "[basics('workspaceName')]",
       "workspaceRetentionDays": "[int(basics('workspaceRetentionDays'))]",
-      "storageAccountName": "[basics('storageAccountName')]"
+      "storageAccountName": "[basics('storageAccountName')]",
+      "deployNatGateway": "[basics('deployNatGateway')]"
     }
   }
 }

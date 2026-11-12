@@ -1,8 +1,11 @@
 // ============================================================================
 //  main.bicep - Central SLA monitoring platform (private, keyless)
 //
-//  Resource group scope. Every service-to-service path uses a private endpoint
-//  and no shared keys or connection strings exist. See README "Network and data flows".
+//  Resource group scope. Every data path uses a private endpoint and no shared
+//  keys or connection strings exist. The only flow that leaves the VNet is the
+//  Function's Azure Resource Graph call to management.azure.com (no private
+//  endpoint exists for it): NAT gateway + NSG that only allows the
+//  AzureResourceManager service tag. See README "Network and data flows".
 //
 //    az group create -n rg-sla-monitoring -l westeurope
 //    az deployment group create -g rg-sla-monitoring -f main.bicep \
@@ -40,12 +43,8 @@ param reportsContainerName string = 'reports'
 @description('Private blob container that Flex Consumption uses for the deployed code package.')
 param deploymentContainerName string = 'app-package'
 
-@description('Where the Function reads the resource inventory: "loganalytics" (arg() through the private workspace, no ARM access needed) or "arm" (calls Azure Resource Graph on management.azure.com; needs ARM reachability from the VNet).')
-@allowed([
-  'loganalytics'
-  'arm'
-])
-param inventorySource string = 'loganalytics'
+@description('Create a NAT gateway for the Function subnet. The Function reads the resource inventory from Azure Resource Graph through management.azure.com, which has no private endpoint: this single flow leaves through the NAT gateway while the subnet NSG only allows the AzureResourceManager service tag. Set false only if you provide the same egress yourself (hub firewall/UDR to management.azure.com, or ARM Private Link).')
+param deployNatGateway bool = true
 
 @description('Address space for the VNet hosting private endpoints + Function integration.')
 param vnetAddressPrefix string = '10.50.0.0/24'
@@ -97,6 +96,69 @@ resource appInsights 'Microsoft.Insights/components@2020-02-02' = {
 }
 
 // ---------------------------------------------------------------------------
+// Controlled egress for the Function subnet.
+// Log Analytics, Storage, Application Insights and the data collection endpoint
+// are all reached through private endpoints. The one exception is Azure Resource
+// Manager (the Azure Resource Graph inventory): management.azure.com has no
+// private endpoint, so that flow leaves through a NAT gateway and the NSG blocks
+// every other internet destination. The subnet has no default outbound access.
+// ---------------------------------------------------------------------------
+resource nsgFunctions 'Microsoft.Network/networkSecurityGroups@2023-11-01' = {
+  name: 'nsg-sla-functions'
+  location: location
+  tags: tags
+  properties: {
+    securityRules: [
+      {
+        name: 'allow-azure-resource-manager'
+        properties: {
+          priority: 100
+          direction: 'Outbound'
+          access: 'Allow'
+          protocol: 'Tcp'
+          sourceAddressPrefix: '*'
+          sourcePortRange: '*'
+          destinationAddressPrefix: 'AzureResourceManager'
+          destinationPortRange: '443'
+        }
+      }
+      {
+        name: 'deny-internet-outbound'
+        properties: {
+          priority: 4000
+          direction: 'Outbound'
+          access: 'Deny'
+          protocol: '*'
+          sourceAddressPrefix: '*'
+          sourcePortRange: '*'
+          destinationAddressPrefix: 'Internet'
+          destinationPortRange: '*'
+        }
+      }
+    ]
+  }
+}
+
+resource natIp 'Microsoft.Network/publicIPAddresses@2023-11-01' = if (deployNatGateway) {
+  name: 'pip-nat-sla'
+  location: location
+  tags: tags
+  sku: { name: 'Standard' }
+  properties: { publicIPAllocationMethod: 'Static' }
+}
+
+resource natGateway 'Microsoft.Network/natGateways@2023-11-01' = if (deployNatGateway) {
+  name: 'nat-sla'
+  location: location
+  tags: tags
+  sku: { name: 'Standard' }
+  properties: {
+    idleTimeoutInMinutes: 10
+    publicIpAddresses: [ { id: natIp.id } ]
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Virtual network: one subnet for private endpoints, one delegated to Flex
 // ---------------------------------------------------------------------------
 resource vnet 'Microsoft.Network/virtualNetworks@2023-11-01' = {
@@ -117,6 +179,9 @@ resource vnet 'Microsoft.Network/virtualNetworks@2023-11-01' = {
         name: 'snet-functions'
         properties: {
           addressPrefix: functionSubnetPrefix
+          defaultOutboundAccess: false
+          networkSecurityGroup: { id: nsgFunctions.id }
+          natGateway: deployNatGateway ? { id: natGateway.id } : null
           delegations: [
             {
               name: 'flexconsumption'
@@ -285,6 +350,71 @@ resource amplsAppInsights 'Microsoft.Insights/privateLinkScopes/scopedResources@
   properties: { linkedResourceId: appInsights.id }
 }
 
+// ---------------------------------------------------------------------------
+// Inventory ingestion (Logs Ingestion API over the same Private Link scope).
+// arg('') cannot be used on a workspace reached through Azure Monitor Private
+// Link ("The Azure Data Explorer (ADX) pattern cannot be used with Private
+// Link"), so the RefreshInventory Function writes a daily Azure Resource Graph
+// snapshot into SlaInventory_CL and the workbook joins that table instead.
+// ---------------------------------------------------------------------------
+var inventoryTableName = 'SlaInventory_CL'
+var inventoryStream = 'Custom-${inventoryTableName}'
+var inventoryColumns = [
+  { name: 'TimeGenerated', type: 'datetime' }
+  { name: 'ResourceId', type: 'string' }
+  { name: 'RType', type: 'string' }
+  { name: 'Region', type: 'string' }
+  { name: 'ArgType', type: 'string' }
+]
+
+resource inventoryTable 'Microsoft.OperationalInsights/workspaces/tables@2022-10-01' = {
+  parent: workspace
+  name: inventoryTableName
+  properties: {
+    schema: { name: inventoryTableName, columns: inventoryColumns }
+    retentionInDays: 30
+  }
+}
+
+resource dce 'Microsoft.Insights/dataCollectionEndpoints@2023-03-11' = {
+  name: 'dce-sla'
+  location: location
+  tags: tags
+  properties: {
+    networkAcls: { publicNetworkAccess: 'Disabled' }
+  }
+}
+
+resource amplsDce 'Microsoft.Insights/privateLinkScopes/scopedResources@2021-09-01' = {
+  parent: ampls
+  name: 'scoped-dce-sla'
+  properties: { linkedResourceId: dce.id }
+}
+
+resource dcr 'Microsoft.Insights/dataCollectionRules@2023-03-11' = {
+  name: 'dcr-sla-inventory'
+  location: location
+  tags: tags
+  properties: {
+    dataCollectionEndpointId: dce.id
+    streamDeclarations: {
+      '${inventoryStream}': { columns: inventoryColumns }
+    }
+    destinations: {
+      logAnalytics: [ { name: 'law', workspaceResourceId: workspace.id } ]
+    }
+    dataFlows: [
+      {
+        streams: [ inventoryStream ]
+        destinations: [ 'law' ]
+        transformKql: 'source'
+        outputStream: inventoryStream
+      }
+    ]
+  }
+  dependsOn: [ inventoryTable ]
+}
+
 resource peAmpls 'Microsoft.Network/privateEndpoints@2023-11-01' = {
   name: 'pe-ampls-sla'
   location: location
@@ -301,7 +431,7 @@ resource peAmpls 'Microsoft.Network/privateEndpoints@2023-11-01' = {
       }
     ]
   }
-  dependsOn: [ amplsWorkspace, amplsAppInsights ]
+  dependsOn: [ amplsWorkspace, amplsAppInsights, amplsDce ]
 }
 
 resource peAmplsDns 'Microsoft.Network/privateEndpoints/privateDnsZoneGroups@2023-11-01' = {
@@ -369,7 +499,9 @@ resource func 'Microsoft.Web/sites@2024-04-01' = {
         { name: 'STORAGE_BLOB_ENDPOINT', value: storage.properties.primaryEndpoints.blob }
         { name: 'REPORTS_CONTAINER', value: reportsContainerName }
         { name: 'MATRIX_MONTHS', value: '12' }
-        { name: 'INVENTORY_SOURCE', value: inventorySource }
+        { name: 'DCE_LOGS_INGESTION_ENDPOINT', value: dce.properties.logsIngestion.endpoint }
+        { name: 'DCR_IMMUTABLE_ID', value: dcr.properties.immutableId }
+        { name: 'INVENTORY_STREAM', value: inventoryStream }
       ]
     }
   }
@@ -411,13 +543,14 @@ resource peSiteDns 'Microsoft.Network/privateEndpoints/privateDnsZoneGroups@2023
 
 // ---------------------------------------------------------------------------
 // RBAC for the Function managed identity.
-//   - Log Analytics Reader on the workspace (query API, incl. arg() inventory)
+//   - Log Analytics Reader on the workspace (query API)
 //   - Blob Data Owner (host state, code package, report upload) + Queue/Table
 //     Data Contributor (Functions host with identity-based AzureWebJobsStorage)
+//   - Monitoring Metrics Publisher on the data collection rule (inventory ingestion)
 //
-// The inventory also needs Reader on every reported subscription (arg() and
-// Azure Resource Graph evaluate the caller's permissions). This template is
-// resource-group scoped, so grant it out-of-band (or via activity-export.bicep):
+// The inventory also needs Reader on every reported subscription (Azure Resource
+// Graph evaluates the caller's permissions). This template is resource-group
+// scoped, so grant it out-of-band (or via activity-export.bicep):
 //   az role assignment create --assignee-object-id <functionAppPrincipalId> \
 //     --assignee-principal-type ServicePrincipal --role Reader \
 //     --scope /subscriptions/<subId>
@@ -426,6 +559,7 @@ var roleLogAnalyticsReader   = '73c42c96-874c-492b-b04d-ab87d138a893'
 var roleBlobDataOwner        = 'b7e6dc6d-f1e8-4753-8033-0f276bb0955b'
 var roleQueueDataContributor = '974c5e8b-45b9-4653-ba55-5f855dd0fb88'
 var roleTableDataContributor = '0a9a7e1f-b9d0-4cc4-a60d-0319b160aaa3'
+var roleMonitoringMetricsPublisher = '3913510d-42f4-4e42-8a64-420c390055eb'
 
 resource raLaReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   name: guid(workspace.id, func.id, roleLogAnalyticsReader)
@@ -467,6 +601,16 @@ resource raTable 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   }
 }
 
+resource raDcr 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(dcr.id, func.id, roleMonitoringMetricsPublisher)
+  scope: dcr
+  properties: {
+    principalId: func.identity.principalId
+    principalType: 'ServicePrincipal'
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', roleMonitoringMetricsPublisher)
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Azure Workbook (self-service report) - primary consumer surface
 // ---------------------------------------------------------------------------
@@ -493,4 +637,6 @@ output storageAccount         string = storage.name
 output reportsContainer       string = reportsContainerName
 output reportBlobPathHint     string = 'Reports are private. Read via Portal Storage browser / Storage Explorer with Storage Blob Data Reader on ${storage.name}/${reportsContainerName} over the private endpoint.'
 output vnetId                 string = vnet.id
+output inventoryTable         string = inventoryTableName
+output dataCollectionRuleId   string = dcr.id
 output workbookResourceId     string = workbook.id

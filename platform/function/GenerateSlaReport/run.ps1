@@ -9,8 +9,10 @@
 #      UnavailableMinutes, PlatformEvents)
 #   - Region x Month (12-month) availability matrix, 100% backfilled
 # Renders HTML/CSV and writes them to a PRIVATE blob container. Everything is
-# REST with the managed identity: no Az modules, no PowerShell Gallery, no ARM
-# call (default inventory source), so the Function needs no internet egress.
+# REST with the managed identity (Shared/SlaCommon.ps1): no Az modules, no
+# PowerShell Gallery. Log Analytics and Blob are reached over private endpoints;
+# the inventory (Azure Resource Graph) is the only call that leaves the VNet,
+# towards management.azure.com through the NSG-restricted NAT gateway.
 #
 # Query semantics mirror the workbook exactly:
 #   - AzureActivity / CategoryValue == 'ResourceHealth'
@@ -23,65 +25,16 @@
 #   STORAGE_BLOB_ENDPOINT - Blob endpoint of the storage account
 #   REPORTS_CONTAINER     - private blob container for reports (default 'reports')
 #   MATRIX_MONTHS         - default 12
-#   INVENTORY_SOURCE      - 'loganalytics' (default, arg() in the workspace) or 'arm'
 # =============================================================================
 param($Timer)
 
 $ErrorActionPreference = 'Stop'
-$workspaceId     = $env:WORKSPACE_ID
-$blobEndpoint    = $env:STORAGE_BLOB_ENDPOINT
-$container       = if ($env:REPORTS_CONTAINER) { $env:REPORTS_CONTAINER } else { 'reports' }
-$matrixMonths    = if ($env:MATRIX_MONTHS) { [int]$env:MATRIX_MONTHS } else { 12 }
-$inventorySource = if ($env:INVENTORY_SOURCE) { $env:INVENTORY_SOURCE } else { 'loganalytics' }
-if (-not $workspaceId -or -not $blobEndpoint) { throw 'WORKSPACE_ID and STORAGE_BLOB_ENDPOINT app settings are required.' }
+. "$PSScriptRoot/../Shared/SlaCommon.ps1"
 
-$script:tokens = @{}
-
-# Managed identity token; the az CLI branch exists only for local testing.
-function Get-AccessToken([string]$Resource) {
-    $cached = $script:tokens[$Resource]
-    if ($cached -and $cached.Expires -gt [datetime]::UtcNow.AddMinutes(5)) { return $cached.Value }
-    if ($env:IDENTITY_ENDPOINT) {
-        $uri = '{0}?resource={1}&api-version=2019-08-01' -f $env:IDENTITY_ENDPOINT, [uri]::EscapeDataString($Resource)
-        $r = Invoke-RestMethod -Uri $uri -Headers @{ 'X-IDENTITY-HEADER' = $env:IDENTITY_HEADER }
-        $token = @{ Value = $r.access_token; Expires = [datetimeoffset]::FromUnixTimeSeconds([long]$r.expires_on).UtcDateTime }
-    } else {
-        $token = @{ Value = (az account get-access-token --resource $Resource --query accessToken -o tsv); Expires = [datetime]::UtcNow.AddMinutes(30) }
-    }
-    $script:tokens[$Resource] = $token
-    return $token.Value
-}
-
-# Retries throttling and transient failures; anything else fails the run.
-function Invoke-Rest {
-    param([string]$Method, [string]$Uri, [string]$Resource, $Body, [hashtable]$Headers = @{}, [string]$ContentType = 'application/json')
-    $h = @{ Authorization = 'Bearer ' + (Get-AccessToken $Resource) } + $Headers
-    for ($try = 1; ; $try++) {
-        try {
-            return Invoke-RestMethod -Method $Method -Uri $Uri -Headers $h -ContentType $ContentType -Body $Body
-        } catch {
-            $code = if ($_.Exception.Response) { [int]$_.Exception.Response.StatusCode } else { 0 }
-            if ($try -ge 4 -or $code -notin 0, 429, 500, 502, 503, 504) {
-                throw "$Method $Uri failed (HTTP $code): $($_.ErrorDetails.Message) $($_.Exception.Message)"
-            }
-            Start-Sleep -Seconds (5 * $try)
-        }
-    }
-}
-
-# 'Prefer: wait' lifts the default 3-minute server-side query timeout.
-function Invoke-LaQuery([string]$Kql) {
-    $body = @{ query = $Kql } | ConvertTo-Json -Compress
-    $r = Invoke-Rest -Method Post -Uri "https://api.loganalytics.azure.com/v1/workspaces/$workspaceId/query" `
-        -Resource 'https://api.loganalytics.io' -Body $body -Headers @{ Prefer = 'wait=600' }
-    if ($r.error) { throw "Log Analytics query error: $($r.error.message)" }
-    $cols = @($r.tables[0].columns | ForEach-Object { $_.name })
-    foreach ($row in $r.tables[0].rows) {
-        $o = [ordered]@{}
-        for ($i = 0; $i -lt $cols.Count; $i++) { $o[$cols[$i]] = $row[$i] }
-        [pscustomobject]$o
-    }
-}
+$blobEndpoint = $env:STORAGE_BLOB_ENDPOINT
+$container    = if ($env:REPORTS_CONTAINER) { $env:REPORTS_CONTAINER } else { 'reports' }
+$matrixMonths = if ($env:MATRIX_MONTHS) { [int]$env:MATRIX_MONTHS } else { 12 }
+if (-not $env:WORKSPACE_ID -or -not $blobEndpoint) { throw 'WORKSPACE_ID and STORAGE_BLOB_ENDPOINT app settings are required.' }
 
 function Publish-Blob([string]$Name, [string]$Content, [string]$ContentType) {
     $uri = '{0}/{1}/{2}' -f $blobEndpoint.TrimEnd('/'), $container, $Name
@@ -102,121 +55,27 @@ $matrixEndEx = $reportEnd
 Write-Host "Reporting month: $report"
 
 # -----------------------------------------------------------------------------
-# 0. Service catalog (identical to inject-queries.ps1 / the workbook)
-#    RType, name, token (ResourceHealth path), arg (ARG type), sla, basis
+# 0. Service catalog (Shared/SlaCommon.ps1; identical to inject-queries.ps1 / the workbook)
 # -----------------------------------------------------------------------------
-$services = @(
-  @{ RType='VM';              name='Virtual Machines';            token='/providers/microsoft.compute/virtualmachines/';                 arg='microsoft.compute/virtualmachines';                 sla='99.9% / 99.95% / 99.99%'; basis='Single VM Premium SSD / Av Set / Av Zones' },
-  @{ RType='VMSS';            name='VM Scale Sets';               token='/providers/microsoft.compute/virtualmachinescalesets/';         arg='microsoft.compute/virtualmachinescalesets';         sla='99.95% / 99.99%';         basis='Av Set or multi-zone' },
-  @{ RType='AppService';      name='App Service';                 token='/providers/microsoft.web/sites/';                               arg='microsoft.web/sites';                               sla='99.95%';                  basis='Standard or higher tier' },
-  @{ RType='StaticWebApp';    name='Static Web Apps';             token='/providers/microsoft.web/staticsites/';                         arg='microsoft.web/staticsites';                         sla='99.95%';                  basis='Standard' },
-  @{ RType='AKS';             name='AKS';                         token='/providers/microsoft.containerservice/managedclusters/';        arg='microsoft.containerservice/managedclusters';        sla='99.95%';                  basis='Uptime SLA enabled' },
-  @{ RType='ContainerApp';    name='Container Apps';              token='/providers/microsoft.app/containerapps/';                       arg='microsoft.app/containerapps';                       sla='99.95%';                  basis='Standard' },
-  @{ RType='ACI';             name='Container Instances';         token='/providers/microsoft.containerinstance/containergroups/';       arg='microsoft.containerinstance/containergroups';       sla='99.9%';                   basis='Standard' },
-  @{ RType='ServiceFabric';   name='Service Fabric';              token='/providers/microsoft.servicefabric/clusters/';                  arg='microsoft.servicefabric/clusters';                  sla='99.95%';                  basis='Silver/Gold durability' },
-  @{ RType='Batch';           name='Batch';                       token='/providers/microsoft.batch/batchaccounts/';                     arg='microsoft.batch/batchaccounts';                     sla='99.9%';                   basis='Standard' },
-  @{ RType='SQL';             name='SQL Database';                token='/providers/microsoft.sql/servers/';                             arg='microsoft.sql/servers';                             sla='99.99%';                  basis='Business Critical / GP HA' },
-  @{ RType='SQLMI';           name='SQL Managed Instance';        token='/providers/microsoft.sql/managedinstances/';                    arg='microsoft.sql/managedinstances';                    sla='99.99%';                  basis='Business Critical' },
-  @{ RType='Cosmos';          name='Cosmos DB';                   token='/providers/microsoft.documentdb/databaseaccounts/';             arg='microsoft.documentdb/databaseaccounts';             sla='99.99% / 99.999%';        basis='Single / multi-region writes' },
-  @{ RType='Postgres';        name='PostgreSQL Flexible';         token='/providers/microsoft.dbforpostgresql/flexibleservers/';         arg='microsoft.dbforpostgresql/flexibleservers';         sla='99.99%';                  basis='HA enabled' },
-  @{ RType='MySQL';           name='MySQL Flexible';              token='/providers/microsoft.dbformysql/flexibleservers/';              arg='microsoft.dbformysql/flexibleservers';              sla='99.99%';                  basis='HA enabled' },
-  @{ RType='MariaDB';         name='MariaDB';                     token='/providers/microsoft.dbformariadb/servers/';                    arg='microsoft.dbformariadb/servers';                    sla='99.99%';                  basis='Standard' },
-  @{ RType='Synapse';         name='Synapse Analytics';           token='/providers/microsoft.synapse/workspaces/';                      arg='microsoft.synapse/workspaces';                      sla='99.9%';                   basis='Standard' },
-  @{ RType='DataExplorer';    name='Data Explorer';               token='/providers/microsoft.kusto/clusters/';                          arg='microsoft.kusto/clusters';                          sla='99.9%';                   basis='Standard' },
-  @{ RType='DataFactory';     name='Data Factory';                token='/providers/microsoft.datafactory/factories/';                   arg='microsoft.datafactory/factories';                   sla='99.9%';                   basis='Standard' },
-  @{ RType='Databricks';      name='Databricks';                  token='/providers/microsoft.databricks/workspaces/';                   arg='microsoft.databricks/workspaces';                   sla='99.95%';                  basis='Premium' },
-  @{ RType='Storage';         name='Storage Account';             token='/providers/microsoft.storage/storageaccounts/';                 arg='microsoft.storage/storageaccounts';                 sla='99.9% / 99.99%';          basis='LRS write / GRS read' },
-  @{ RType='KeyVault';        name='Key Vault';                   token='/providers/microsoft.keyvault/vaults/';                         arg='microsoft.keyvault/vaults';                         sla='99.99%';                  basis='Standard' },
-  @{ RType='Redis';           name='Cache for Redis';             token='/providers/microsoft.cache/redis/';                             arg='microsoft.cache/redis';                             sla='99.9%';                   basis='Standard / Premium' },
-  @{ RType='ServiceBus';      name='Service Bus';                 token='/providers/microsoft.servicebus/namespaces/';                   arg='microsoft.servicebus/namespaces';                   sla='99.9% / 99.95%';          basis='Std / Premium' },
-  @{ RType='EventHub';        name='Event Hubs';                  token='/providers/microsoft.eventhub/namespaces/';                     arg='microsoft.eventhub/namespaces';                     sla='99.95%';                  basis='Standard' },
-  @{ RType='EventGridTopic';  name='Event Grid Topic';            token='/providers/microsoft.eventgrid/topics/';                        arg='microsoft.eventgrid/topics';                        sla='99.99%';                  basis='Standard' },
-  @{ RType='EventGridDomain'; name='Event Grid Domain';           token='/providers/microsoft.eventgrid/domains/';                       arg='microsoft.eventgrid/domains';                       sla='99.99%';                  basis='Standard' },
-  @{ RType='APIManagement';   name='API Management';              token='/providers/microsoft.apimanagement/service/';                   arg='microsoft.apimanagement/service';                   sla='99.95% / 99.99%';         basis='Std / Premium multi-region' },
-  @{ RType='LogicApps';       name='Logic Apps (Consumption)';    token='/providers/microsoft.logic/workflows/';                         arg='microsoft.logic/workflows';                         sla='99.9%';                   basis='Standard' },
-  @{ RType='NotificationHub'; name='Notification Hubs';           token='/providers/microsoft.notificationhubs/namespaces/';             arg='microsoft.notificationhubs/namespaces';             sla='99.9%';                   basis='Standard' },
-  @{ RType='Relay';           name='Relay';                       token='/providers/microsoft.relay/namespaces/';                        arg='microsoft.relay/namespaces';                        sla='99.9%';                   basis='Standard' },
-  @{ RType='SignalR';         name='SignalR';                     token='/providers/microsoft.signalrservice/signalr/';                  arg='microsoft.signalrservice/signalr';                  sla='99.9%';                   basis='Standard' },
-  @{ RType='WebPubSub';       name='Web PubSub';                  token='/providers/microsoft.signalrservice/webpubsub/';                arg='microsoft.signalrservice/webpubsub';                sla='99.9%';                   basis='Standard' },
-  @{ RType='Cognitive';       name='Cognitive Services / OpenAI'; token='/providers/microsoft.cognitiveservices/accounts/';              arg='microsoft.cognitiveservices/accounts';              sla='99.9%';                   basis='Standard' },
-  @{ RType='AISearch';        name='AI Search';                   token='/providers/microsoft.search/searchservices/';                   arg='microsoft.search/searchservices';                   sla='99.9%';                   basis='Standard 2+ replicas' },
-  @{ RType='AppGw';           name='Application Gateway';         token='/providers/microsoft.network/applicationgateways/';             arg='microsoft.network/applicationgateways';             sla='99.95%';                  basis='Standard_v2' },
-  @{ RType='LoadBalancer';    name='Load Balancer';               token='/providers/microsoft.network/loadbalancers/';                   arg='microsoft.network/loadbalancers';                   sla='99.99%';                  basis='Standard SKU' },
-  @{ RType='PublicIP';        name='Public IP';                   token='/providers/microsoft.network/publicipaddresses/';               arg='microsoft.network/publicipaddresses';               sla='99.99%';                  basis='Standard SKU' },
-  @{ RType='NatGateway';      name='NAT Gateway';                 token='/providers/microsoft.network/natgateways/';                     arg='microsoft.network/natgateways';                     sla='99.99%';                  basis='Standard' },
-  @{ RType='Firewall';        name='Firewall';                    token='/providers/microsoft.network/azurefirewalls/';                  arg='microsoft.network/azurefirewalls';                  sla='99.95% / 99.99%';         basis='Std / AZ' },
-  @{ RType='Bastion';         name='Bastion';                     token='/providers/microsoft.network/bastionhosts/';                    arg='microsoft.network/bastionhosts';                    sla='99.95%';                  basis='Standard' },
-  @{ RType='PrivateEndpoint'; name='Private Endpoint';            token='/providers/microsoft.network/privateendpoints/';                arg='microsoft.network/privateendpoints';                sla='99.9%';                   basis='Standard' },
-  @{ RType='DnsZone';         name='DNS Zone';                    token='/providers/microsoft.network/dnszones/';                        arg='microsoft.network/dnszones';                        sla='100%';                    basis='Public DNS' },
-  @{ RType='PrivateDnsZone';  name='Private DNS Zone';            token='/providers/microsoft.network/privatednszones/';                 arg='microsoft.network/privatednszones';                 sla='100%';                    basis='Private DNS' },
-  @{ RType='VNetGateway';     name='VPN / ER Gateway';            token='/providers/microsoft.network/virtualnetworkgateways/';          arg='microsoft.network/virtualnetworkgateways';          sla='99.95%';                  basis='VpnGw / ErGw' },
-  @{ RType='ExpressRoute';    name='ExpressRoute Circuit';        token='/providers/microsoft.network/expressroutecircuits/';            arg='microsoft.network/expressroutecircuits';            sla='99.95%';                  basis='Standard' },
-  @{ RType='FrontDoor';       name='Front Door (Classic)';        token='/providers/microsoft.network/frontdoors/';                      arg='microsoft.network/frontdoors';                      sla='99.99%';                  basis='Classic' },
-  @{ RType='CDN';             name='CDN / Front Door Std/Premium';token='/providers/microsoft.cdn/profiles/';                            arg='microsoft.cdn/profiles';                            sla='99.99%';                  basis='Std / Premium' },
-  @{ RType='TrafficManager';  name='Traffic Manager';             token='/providers/microsoft.network/trafficmanagerprofiles/';          arg='microsoft.network/trafficmanagerprofiles';          sla='99.99%';                  basis='Standard' },
-  @{ RType='ManagedIdentity'; name='Managed Identity';            token='/providers/microsoft.managedidentity/userassignedidentities/';  arg='microsoft.managedidentity/userassignedidentities';  sla='99.9%';                   basis='Standard' }
-)
-
-# Lookup maps derived from the catalog
-$argToRType = @{}
-$expected   = @{}
-foreach ($s in $services) {
-    $argToRType[$s.arg] = $s.RType
-    $expected[$s.RType] = @{ sla = $s.sla; basis = $s.basis }
-}
-$argList    = ($services | ForEach-Object { "'" + $_.arg + "'" }) -join ','
+$services = $script:ServiceCatalog
+$expected = @{}
+foreach ($s in $services) { $expected[$s.RType] = @{ sla = $s.sla; basis = $s.basis } }
 $tokenArray = '[' + (($services | ForEach-Object { "'" + $_.token + "'" }) -join ',') + ']'
 
 # -----------------------------------------------------------------------------
 # 1. Inventory from Azure Resource Graph (real region + RType, 100% backfill base)
-#    loganalytics: arg('') runs inside the private workspace, no ARM call.
-#    arm:          ARG REST on management.azure.com (needs ARM reachability).
 # -----------------------------------------------------------------------------
-$invFilter = "tolower(type) in ($argList)"
-$invProject = 'project ResourceId = tolower(id), Region = tostring(location), ArgType = tolower(type)'
-$inventory = [System.Collections.Generic.List[object]]::new()
-
-function Add-InventoryRow($ResourceId, $Region, $ArgType) {
-    $rt = $argToRType[$ArgType]
-    $inventory.Add([pscustomobject]@{ ResourceId = $ResourceId; Region = $Region; RType = if ($rt) { $rt } else { 'Other' } })
-}
-
-if ($inventorySource -eq 'arm') {
-    $skipToken = $null
-    do {
-        $options = @{ '$top' = 1000 }
-        if ($skipToken) { $options['$skipToken'] = $skipToken }
-        $body = @{ query = "resources | where $invFilter | $invProject"; options = $options } | ConvertTo-Json -Compress
-        $page = Invoke-Rest -Method Post -Uri 'https://management.azure.com/providers/Microsoft.ResourceGraph/resources?api-version=2022-10-01' `
-            -Resource 'https://management.azure.com/' -Body $body
-        foreach ($r in $page.data) { Add-InventoryRow $r.ResourceId $r.Region $r.ArgType }
-        $skipToken = $page.'$skipToken'
-    } while ($skipToken)
-    $expectedCount = $inventory.Count
-} else {
-    try {
-        # arg('') returns at most 1000 rows, so page with a keyset cursor (strcmp: KQL has no string '>').
-        $cursor = ''
-        for ($page = 0; $page -lt 500; $page++) {
-            $escaped = $cursor.Replace('\', '\\').Replace("'", "\'")
-            $rows = @(Invoke-LaQuery "arg('').resources | where $invFilter | $invProject | where strcmp(ResourceId, '$escaped') > 0 | order by ResourceId asc | take 1000")
-            foreach ($r in $rows) { Add-InventoryRow $r.ResourceId $r.Region $r.ArgType }
-            if ($rows.Count -lt 1000) { break }
-            $cursor = $rows[-1].ResourceId
-        }
-        $expectedCount = [int]@(Invoke-LaQuery "arg('').resources | where $invFilter | summarize n = count()")[0].n
-    } catch {
-        throw "Inventory through arg() failed: $($_.Exception.Message). Check the Function identity has Reader on the subscriptions; if arg() is blocked for this private workspace, set INVENTORY_SOURCE=arm (needs ARM reachability)."
-    }
+try {
+    $inventory = @(Get-ArgInventory)
+} catch {
+    throw "Inventory through Azure Resource Graph failed: $($_.Exception.Message). The Function identity needs Reader on the subscriptions and outbound HTTPS to management.azure.com (NAT gateway / firewall egress, see README)."
 }
 $inventoryNote = ''
 if ($inventory.Count -eq 0) {
     $inventoryNote = 'No resources found: grant the Function identity Reader on the subscriptions to report.'
-} elseif ($inventory.Count -ne $expectedCount) {
-    $inventoryNote = "Inventory incomplete: $($inventory.Count) of $expectedCount resources listed."
+    Write-Warning $inventoryNote
 }
-if ($inventoryNote) { Write-Warning $inventoryNote }
-Write-Host "Inventory resources (all selected types): $($inventory.Count) via $inventorySource"
+Write-Host "Inventory resources (all selected types): $($inventory.Count) via Azure Resource Graph"
 
 # -----------------------------------------------------------------------------
 # 2. Downtime seconds per resource per month from Log Analytics

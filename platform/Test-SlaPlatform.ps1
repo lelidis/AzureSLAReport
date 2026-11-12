@@ -1,6 +1,6 @@
 # Validation script for the SLA reporting platform.
 # Compatible with PowerShell 7+. Run it from a host that can reach the private endpoints:
-# check 9 queries the private Log Analytics workspace and reports no data otherwise.
+# checks 9 and 9b query the private Log Analytics workspace and report no data otherwise.
 
 [CmdletBinding()]
 param(
@@ -28,6 +28,23 @@ function FromJson {
 function Pick {
     param($Cond, $A, $B = '')
     if ($Cond) { return $A } else { return $B }
+}
+
+# First result row of a Log Analytics query as a hashtable (column -> value), or $null.
+# Handles both output shapes of `az monitor log-analytics query`: a list of row objects
+# (current log-analytics extension) and the raw API shape with a `tables` array.
+function Get-LaRow {
+    param([string]$WorkspaceCustomerId, [string]$Kql)
+    $res = FromJson (az monitor log-analytics query -w $WorkspaceCustomerId --analytics-query $Kql -o json 2>$null)
+    if ($null -eq $res) { return $null }
+    if ($res -is [System.Collections.IDictionary] -and $res.ContainsKey('tables')) {
+        $t = @($res['tables'])[0]
+        if (-not $t -or @($t.rows).Count -eq 0) { return $null }
+        $row = @{}
+        for ($i = 0; $i -lt @($t.columns).Count; $i++) { $row[$t.columns[$i].name] = @($t.rows)[0][$i] }
+        return $row
+    }
+    return @($res)[0]
 }
 
 Write-Host "Subscription: $(az account show --query name -o tsv)" -ForegroundColor Cyan
@@ -70,6 +87,20 @@ Add-Check '4b. Function App MI' $miOk (Pick $miOk $fn.identity.principalId 'no M
 if ($fn) {
     $netOk = ($fn.publicNetworkAccess -eq 'Disabled') -and [bool]$fn.virtualNetworkSubnetId
     Add-Check '4c. Function private + VNet-integrated' $netOk "publicNetworkAccess=$($fn.publicNetworkAccess); kind=$($fn.kind)"
+
+    # 4d. Function subnet egress is locked down: NSG attached, no default outbound access.
+    # The NAT gateway is the single path to Azure Resource Manager (absent if deployed with deployNatGateway=false).
+    $subId = az account show --query id -o tsv
+    $snet = FromJson (az rest --method get --uri "https://management.azure.com/subscriptions/$subId/resourceGroups/$ResourceGroup/providers/Microsoft.Network/virtualNetworks/vnet-sla/subnets/snet-functions?api-version=2023-11-01" 2>$null)
+    if ($snet) {
+        $p = $snet.properties
+        $hasNsg = [bool]$p.networkSecurityGroup
+        $hasNat = [bool]$p.natGateway
+        $egressOk = $hasNsg -and ($p.defaultOutboundAccess -eq $false)
+        Add-Check '4d. Function subnet egress locked (NSG, no default outbound)' $egressOk "nsg=$hasNsg; defaultOutboundAccess=$($p.defaultOutboundAccess); natGateway=$hasNat"
+    } else {
+        Add-Check '4d. Function subnet egress locked (NSG, no default outbound)' $false 'subnet snet-functions not found'
+    }
 }
 
 # 5. RBAC for the Function MI
@@ -85,6 +116,17 @@ if ($miOk -and $sa) {
     if ($r2) { $hasBlob = [bool]($r2 | Where-Object { $_.roleDefinitionName -eq 'Storage Blob Data Owner' }) }
     Add-Check '5b. MI -> Blob Data Owner' $hasBlob "$(@($r2).Count) assignment(s) on storage"
 }
+if ($miOk) {
+    $dcrId = az resource list -g $ResourceGroup --resource-type Microsoft.Insights/dataCollectionRules --query "[0].id" -o tsv 2>$null
+    if ($dcrId) {
+        $r3 = FromJson (az role assignment list --assignee $fn.identity.principalId --scope $dcrId 2>$null)
+        $hasDcr = $false
+        if ($r3) { $hasDcr = [bool]($r3 | Where-Object { $_.roleDefinitionName -eq 'Monitoring Metrics Publisher' }) }
+        Add-Check '5c. MI -> Monitoring Metrics Publisher on DCR' $hasDcr "$(@($r3).Count) assignment(s) on $(($dcrId -split '/')[-1])"
+    } else {
+        Add-Check '5c. MI -> Monitoring Metrics Publisher on DCR' $false 'data collection rule not found'
+    }
+}
 
 # 6. Function code is deployed
 if ($fn) {
@@ -96,8 +138,8 @@ if ($fn) {
     if ($funcsRaw) {
         $funcs = ($funcsRaw -split "`r?`n") | Where-Object { $_ } | ForEach-Object { ($_ -split '/')[-1] }
     }
-    $deployed = $funcs -contains 'GenerateSlaReport'
-    Add-Check '6. Function code deployed (GenerateSlaReport)' $deployed ($funcs -join ',')
+    $deployed = ($funcs -contains 'GenerateSlaReport') -and ($funcs -contains 'RefreshInventory')
+    Add-Check '6. Function code deployed (GenerateSlaReport + RefreshInventory)' $deployed ($funcs -join ',')
 }
 
 # 7. Workbook
@@ -128,13 +170,22 @@ AzureActivity
 | where CategoryValue == 'ResourceHealth'
 | summarize Events=count(), Resources=dcount(ResourceId)
 "@
-    $row = FromJson (az monitor log-analytics query -w $customerId --analytics-query $q --query "tables[0].rows[0]" 2>$null)
-    if ($row -and @($row).Count -ge 2) {
-        $events = [int]$row[0]
-        $rcount = [int]$row[1]
-        Add-Check '9. ResourceHealth in last 7d' ([int]$events -gt 0) "Events=$events; Resources=$rcount"
+    $row = Get-LaRow $customerId $q
+    if ($row -and $null -ne $row['Events']) {
+        $events = [int]$row['Events']
+        $rcount = [int]$row['Resources']
+        Add-Check '9. ResourceHealth in last 7d' ($events -gt 0) "Events=$events; Resources=$rcount"
     } else {
         Add-Check '9. ResourceHealth in last 7d' $false 'No data (allow ~15 min after enabling the diag setting) or workspace not reachable from this network'
+    }
+
+    # 9b. Inventory snapshot written by RefreshInventory (workbook reads SlaInventory_CL; arg() is not usable on Private Link)
+    $q2 = 'SlaInventory_CL | summarize Resources=count(), Snapshot=max(TimeGenerated)'
+    $row2 = Get-LaRow $customerId $q2
+    if ($row2 -and $null -ne $row2['Resources'] -and [int]$row2['Resources'] -gt 0) {
+        Add-Check '9b. Inventory snapshot in SlaInventory_CL' $true "Resources=$($row2['Resources']); Snapshot=$($row2['Snapshot'])"
+    } else {
+        Add-Check '9b. Inventory snapshot in SlaInventory_CL' $false 'Empty (run RefreshInventory, README step 4, and wait a few minutes) or workspace not reachable from this network'
     }
 }
 
