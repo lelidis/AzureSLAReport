@@ -1,13 +1,13 @@
 # Azure Availability SLA Report
 
-[![Deploy to Azure](https://aka.ms/deploytoazurebutton)](https://portal.azure.com/#create/Microsoft.Template/uri/https%3A%2F%2Fraw.githubusercontent.com%2Flelidis%2FAzureSLAReport%2F3d5257d39f1b6cab3a3e073c5a58cca31063c425%2Fplatform%2Fmain.json/createUIDefinitionUri/https%3A%2F%2Fraw.githubusercontent.com%2Flelidis%2FAzureSLAReport%2F3d5257d39f1b6cab3a3e073c5a58cca31063c425%2Fplatform%2FcreateUiDefinition.json)
-[![Visualize](https://raw.githubusercontent.com/Azure/azure-quickstart-templates/master/1-CONTRIBUTION-GUIDE/images/visualizebutton.svg?sanitize=true)](https://armviz.io/#/?load=https%3A%2F%2Fraw.githubusercontent.com%2Flelidis%2FAzureSLAReport%2F3d5257d39f1b6cab3a3e073c5a58cca31063c425%2Fplatform%2Fmain.json)
+[![Deploy to Azure](https://aka.ms/deploytoazurebutton)](https://portal.azure.com/#create/Microsoft.Template/uri/https%3A%2F%2Fraw.githubusercontent.com%2Flelidis%2FAzureSLAReport%2Fa3b8b29054352c13dc2d36e945eac354f713ac52%2Fplatform%2Fmain.json/createUIDefinitionUri/https%3A%2F%2Fraw.githubusercontent.com%2Flelidis%2FAzureSLAReport%2Fa3b8b29054352c13dc2d36e945eac354f713ac52%2Fplatform%2FcreateUiDefinition.json)
+[![Visualize](https://raw.githubusercontent.com/Azure/azure-quickstart-templates/master/1-CONTRIBUTION-GUIDE/images/visualizebutton.svg?sanitize=true)](https://armviz.io/#/?load=https%3A%2F%2Fraw.githubusercontent.com%2Flelidis%2FAzureSLAReport%2Fa3b8b29054352c13dc2d36e945eac354f713ac52%2Fplatform%2Fmain.json)
 
 Self-service Azure Workbook + Bicep platform that produces platform-availability SLA reports across many Azure services from `AzureActivity` Resource Health events, enriched with an Azure Resource Graph (ARG) inventory so even 100%-healthy resources appear.
 
 > **This branch (`enterprise-private`) is the private, keyless build.** Every data path goes over a private endpoint: the Function App runs on **Flex Consumption** with a managed identity, Storage has public access **and** shared keys disabled, and Log Analytics / Application Insights / the data collection endpoint are reached through an Azure Monitor Private Link Scope. Reports land in a **private blob container** read via Entra ID / RBAC. The only flow that cannot use a private endpoint is the Function's Azure Resource Graph call to `management.azure.com`: it leaves through a NAT gateway and an NSG that allows **only** the `AzureResourceManager` service tag (see [Network and data flows](#network-and-data-flows)).
 >
-> The badges above are pinned to this branch's reviewed template (commit `3d5257d`), so the **Deploy to Azure** button now provisions the *private* stack — but it only **creates the infrastructure**. Whichever deploy option you pick, you must then run the **post-deploy steps** ([After the hub template deploys](#after-the-hub-template-deploys-required-for-all-options)) from a host that can reach the new VNet's private endpoints (a VM/agent on the VNet, or your workstation over ExpressRoute/VPN).
+> The badges above are pinned to this branch's reviewed template (commit `a3b8b29`), so the **Deploy to Azure** button now provisions the *private* stack — but it only **creates the infrastructure**. Whichever deploy option you pick, you must then run the **post-deploy steps** ([After the hub template deploys](#after-the-hub-template-deploys-required-for-all-options)) from a host that can reach the new VNet's private endpoints (a VM/agent on the VNet, or your workstation over ExpressRoute/VPN).
 
 ## What it provides
 
@@ -122,13 +122,13 @@ All three options below create the **same private resources**. They differ only 
 
 Click the button at the top of this README, or use this direct link (pinned to this branch's reviewed commit):
 
-> https://portal.azure.com/#create/Microsoft.Template/uri/https%3A%2F%2Fraw.githubusercontent.com%2Flelidis%2FAzureSLAReport%2F3d5257d39f1b6cab3a3e073c5a58cca31063c425%2Fplatform%2Fmain.json/createUIDefinitionUri/https%3A%2F%2Fraw.githubusercontent.com%2Flelidis%2FAzureSLAReport%2F3d5257d39f1b6cab3a3e073c5a58cca31063c425%2Fplatform%2FcreateUiDefinition.json
+> https://portal.azure.com/#create/Microsoft.Template/uri/https%3A%2F%2Fraw.githubusercontent.com%2Flelidis%2FAzureSLAReport%2Fa3b8b29054352c13dc2d36e945eac354f713ac52%2Fplatform%2Fmain.json/createUIDefinitionUri/https%3A%2F%2Fraw.githubusercontent.com%2Flelidis%2FAzureSLAReport%2Fa3b8b29054352c13dc2d36e945eac354f713ac52%2Fplatform%2FcreateUiDefinition.json
 
 The form prompts for subscription, resource group, location, workspace name, retention, storage account name and whether to create the NAT gateway for the Azure Resource Graph call (keep it checked unless you route that egress through your own firewall). The Function App and plan names use the template defaults. The VNet, subnets, private endpoints, AMPLS and private DNS use the template defaults (`10.50.0.0/24` address space) — review the [Prerequisites](#prerequisites) if that range clashes with your network, and in that case use Option B/C so you can override `vnetAddressPrefix`/`privateEndpointSubnetPrefix`/`functionSubnetPrefix`.
 
 > The button only **creates** the (private) resources. You cannot read a report from the portal form — once it finishes, continue with Phase 2 from a host that can reach the VNet. The button references [platform/main.json](platform/main.json) and [platform/createUiDefinition.json](platform/createUiDefinition.json) over `raw.githubusercontent.com`, so the repo and those two files must remain public.
 
-If you fork this repo, swap `lelidis/AzureSLAReport/3d5257d39f1b6cab3a3e073c5a58cca31063c425` in the URL above for `<owner>/<repo>/<branch-or-commit>`.
+If you fork this repo, swap `lelidis/AzureSLAReport/a3b8b29054352c13dc2d36e945eac354f713ac52` in the URL above for `<owner>/<repo>/<branch-or-commit>`.
 
 ### Option B — ARM JSON via Azure CLI
 
