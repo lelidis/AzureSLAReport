@@ -1,5 +1,6 @@
 # Validation script for the SLA reporting platform.
-# Compatible with Windows PowerShell 5.1 and PowerShell 7+.
+# Compatible with PowerShell 7+. Run it from a host that can reach the private endpoints:
+# check 9 queries the private Log Analytics workspace and reports no data otherwise.
 
 [CmdletBinding()]
 param(
@@ -42,17 +43,18 @@ Add-Check '2. Log Analytics workspace' $wsOk (Pick $wsOk "$WorkspaceName / reten
 $workspaceId = $null; $customerId = $null
 if ($wsOk) { $workspaceId = $ws.id; $customerId = $ws.customerId }
 
-# 3. Storage account + static website
+# 3. Storage account: private, keyless, reports container present
 $saList = FromJson (az storage account list -g $ResourceGroup 2>$null)
 $sa = $null
 if ($saList) { $sa = $saList | Where-Object { $_.kind -eq 'StorageV2' } | Select-Object -First 1 }
 Add-Check '3a. Storage account' ([bool]$sa) (Pick ([bool]$sa) $sa.name 'none')
 
 if ($sa) {
-    $sw = FromJson (az storage blob service-properties show --account-name $sa.name --auth-mode login --query staticWebsite 2>$null)
-    $swOk = $false
-    if ($sw -and $sw.enabled) { $swOk = $true }
-    Add-Check '3b. Static website enabled' $swOk (Pick ([bool]$sw) "indexDocument=$($sw.indexDocument)" 'disabled')
+    $private = ($sa.publicNetworkAccess -eq 'Disabled') -and ($sa.allowSharedKeyAccess -eq $false)
+    Add-Check '3b. Storage private + keyless' $private "publicNetworkAccess=$($sa.publicNetworkAccess); allowSharedKeyAccess=$($sa.allowSharedKeyAccess)"
+    $containers = FromJson (az storage container-rm list --storage-account $sa.name -g $ResourceGroup 2>$null)
+    $containerNames = @($containers | ForEach-Object { $_.name })
+    Add-Check '3c. Reports container exists' ($containerNames -contains 'reports') ($containerNames -join ',')
 }
 
 # 4. Function App + identity
@@ -65,6 +67,11 @@ $miOk = $false
 if ($fn -and $fn.identity -and $fn.identity.principalId) { $miOk = $true }
 Add-Check '4b. Function App MI' $miOk (Pick $miOk $fn.identity.principalId 'no MI')
 
+if ($fn) {
+    $netOk = ($fn.publicNetworkAccess -eq 'Disabled') -and [bool]$fn.virtualNetworkSubnetId
+    Add-Check '4c. Function private + VNet-integrated' $netOk "publicNetworkAccess=$($fn.publicNetworkAccess); kind=$($fn.kind)"
+}
+
 # 5. RBAC for the Function MI
 if ($miOk -and $wsOk) {
     $r1 = FromJson (az role assignment list --assignee $fn.identity.principalId --scope $ws.id 2>$null)
@@ -75,8 +82,8 @@ if ($miOk -and $wsOk) {
 if ($miOk -and $sa) {
     $r2 = FromJson (az role assignment list --assignee $fn.identity.principalId --scope $sa.id 2>$null)
     $hasBlob = $false
-    if ($r2) { $hasBlob = [bool]($r2 | Where-Object { $_.roleDefinitionName -eq 'Storage Blob Data Contributor' }) }
-    Add-Check '5b. MI -> Blob Data Contributor' $hasBlob "$(@($r2).Count) assignment(s) on storage"
+    if ($r2) { $hasBlob = [bool]($r2 | Where-Object { $_.roleDefinitionName -eq 'Storage Blob Data Owner' }) }
+    Add-Check '5b. MI -> Blob Data Owner' $hasBlob "$(@($r2).Count) assignment(s) on storage"
 }
 
 # 6. Function code is deployed
@@ -127,30 +134,14 @@ AzureActivity
         $rcount = [int]$row[1]
         Add-Check '9. ResourceHealth in last 7d' ([int]$events -gt 0) "Events=$events; Resources=$rcount"
     } else {
-        Add-Check '9. ResourceHealth in last 7d' $false 'No data yet (allow ~15 min after enabling diag setting)'
+        Add-Check '9. ResourceHealth in last 7d' $false 'No data (allow ~15 min after enabling the diag setting) or workspace not reachable from this network'
     }
 }
 
-# 10. Static site reachable
-if ($sa) {
-    $primaryEp = $null
-    if ($sa.primaryEndpoints) { $primaryEp = $sa.primaryEndpoints.web }
-    if ($primaryEp) {
-        $code = 0
-        try {
-            $resp = Invoke-WebRequest -Uri $primaryEp -Method Head -TimeoutSec 10 -ErrorAction SilentlyContinue
-            if ($resp) { $code = [int]$resp.StatusCode }
-        } catch { $code = 0 }
-        if ($code -eq 0) {
-            try {
-                $curlCode = & curl.exe -s -o NUL -w "%{http_code}" $primaryEp
-                if ($curlCode -match '^\d+$') { $code = [int]$curlCode }
-            } catch { }
-        }
-        $reachable = $code -in 200,403,404
-        Add-Check '10. Static website endpoint reachable' $reachable "$primaryEp (HTTP $code)"
-    }
-}
+# 10. Private endpoints (storage blob/queue/table, function sites, AMPLS) approved
+$pes = @(FromJson (az network private-endpoint list -g $ResourceGroup 2>$null))
+$approved = @($pes | Where-Object { $_.privateLinkServiceConnections[0].privateLinkServiceConnectionState.status -eq 'Approved' }).Count
+Add-Check '10. Private endpoints approved' ($pes.Count -ge 5 -and $approved -eq $pes.Count) "$approved of $($pes.Count) approved (expected 5)"
 
 $results | Format-Table -AutoSize
 $failCount = @($results | Where-Object { $_.Status -eq 'FAIL' }).Count

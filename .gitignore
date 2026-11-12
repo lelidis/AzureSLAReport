@@ -15,6 +15,8 @@ Thumbs.db
 platform/function/bin/
 platform/function/obj/
 platform/function/local.settings.json
+platform/function-deploy.zip
+function.zip
 
 # PowerShell module cache
 **/Modules/

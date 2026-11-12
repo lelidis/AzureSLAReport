@@ -5,9 +5,9 @@
 
 Self-service Azure Workbook + Bicep platform that produces platform-availability SLA reports across many Azure services from `AzureActivity` Resource Health events, enriched with an Azure Resource Graph (ARG) inventory so even 100%-healthy resources appear.
 
-> **This branch (`enterprise-private`) is the private, no-public-ingress build.** Storage public access and the public `$web` static website are removed; the Function App, Log Analytics workspace, App Insights and Storage are reached only through private endpoints inside a dedicated VNet (Azure Monitor Private Link Scope for the monitoring data). Reports land in a **private blob container** read via Entra ID / RBAC.
+> **This branch (`enterprise-private`) is the private, keyless build.** Every service-to-service call goes over a private endpoint: the Function App runs on **Flex Consumption** with a managed identity, Storage has public access **and** shared keys disabled, and Log Analytics / Application Insights are reached through an Azure Monitor Private Link Scope. Reports land in a **private blob container** read via Entra ID / RBAC. The Function needs **no internet egress** (see [Network and data flows](#network-and-data-flows)).
 >
-> The badges above are pinned to this branch's reviewed template (commit `508c937`), so the **Deploy to Azure** button now provisions the *private* stack — but it only **creates the infrastructure**. Whichever deploy option you pick, you must then run the **post-deploy steps** ([After the hub template deploys](#after-the-hub-template-deploys-required-for-all-options)) from a host that can reach the new VNet's private endpoints (a VM/agent on the VNet, or your workstation over ExpressRoute/VPN). The Function also needs **outbound** egress to `management.azure.com` (Azure Resource Graph) and `login.microsoftonline.com` (Entra token); neither has Private Link, so allow them via your NAT gateway/firewall.
+> The badges above are pinned to this branch's reviewed template (commit `508c937`), so the **Deploy to Azure** button now provisions the *private* stack — but it only **creates the infrastructure**. Whichever deploy option you pick, you must then run the **post-deploy steps** ([After the hub template deploys](#after-the-hub-template-deploys-required-for-all-options)) from a host that can reach the new VNet's private endpoints (a VM/agent on the VNet, or your workstation over ExpressRoute/VPN).
 
 ## What it provides
 
@@ -31,13 +31,13 @@ The workbook strictly excludes user-initiated actions from SLA math (uses `reaso
   - Log Analytics workspace (400-day retention by default; public ingestion + query **Disabled**)
   - Application Insights (workspace-based; public access **Disabled**) for Function invocation telemetry
   - Azure Monitor Private Link Scope (**AMPLS**, `PrivateOnly`) scoping the workspace + App Insights
-  - Storage account (`publicNetworkAccess=Disabled`, no static website) with a **private `reports` container** for the monthly output
-  - VNet `vnet-sla` with a private-endpoint subnet and a subnet delegated to the plan for Function regional VNet integration
-  - Private endpoints + private DNS zones for storage (blob/file/queue/table), the Function (`sites`), and AMPLS (`azuremonitor`)
-  - Function App (PowerShell 7.4, timer-triggered: `0 0 6 1 * *`, 1st of month 06:00 UTC) on an **Elastic Premium (EP1)** plan with VNet integration, public access **Disabled**, and SCM/FTP basic auth **Disabled**
-  - RBAC for the Function managed identity: `Log Analytics Reader` on the workspace, plus `Storage Blob Data Contributor`, `Storage Blob Data Owner`, `Storage Queue Data Contributor` and `Storage Table Data Contributor` on the storage account (the last three are required because the host uses identity-based `AzureWebJobsStorage`)
+  - Storage account: `publicNetworkAccess=Disabled`, **shared-key access disabled**, no static website; a private `reports` container (monthly output) and an `app-package` container (Function code)
+  - VNet `vnet-sla` with a private-endpoint subnet and a subnet delegated to `Microsoft.App/environments` for Function VNet integration
+  - Private endpoints + private DNS zones for storage (blob/queue/table), the Function (`sites`), and AMPLS (`azuremonitor`)
+  - Function App on a **Flex Consumption** plan (Linux, PowerShell 7.6, timer-triggered: `0 0 6 1 * *`, 1st of month 06:00 UTC) with public access **Disabled**, a system-assigned identity and no connection strings
+  - RBAC for the Function identity: `Log Analytics Reader` on the workspace, plus `Storage Blob Data Owner`, `Storage Queue Data Contributor` and `Storage Table Data Contributor` on the storage account (the Functions host and the code package use the identity)
   - Azure Workbook (queries injected from `workbook-compute-sla.json`)
-- [platform/function/](platform/function/) — PowerShell Function App code. `GenerateSlaReport/run.ps1` builds the ARG inventory, computes per-resource and region×month availability, and writes HTML/CSV to the private `reports` container via managed identity. Deployed separately from the template (see step 2 of "After the hub template deploys").
+- [platform/function/](platform/function/) — PowerShell Function App code (`host.json` + `GenerateSlaReport/`). `run.ps1` is pure REST with the managed identity (no Az modules): it reads events and the resource inventory through the Log Analytics query API, computes per-resource and region×month availability, and writes HTML/CSV to the private `reports` container. Deployed separately from the template (see step 2 of "After the hub template deploys").
 - [platform/activity-export.bicep](platform/activity-export.bicep) — **Subscription scope.** Deploys per monitored subscription:
   - Activity Log diagnostic setting → workspace (`ResourceHealth` + `Administrative`)
   - `Reader` role assignment for the SLA report identity (so ARG inventory works)
@@ -45,23 +45,62 @@ The workbook strictly excludes user-initiated actions from SLA math (uses `reaso
 
 The workbook JSON contains a placeholder `__WORKSPACE_RESOURCE_ID__` that Bicep replaces at deploy time, so the same file is portable across environments.
 
+## Network and data flows
+
+Every flow stays on the Microsoft backbone and, wherever a private endpoint exists, uses it. No shared keys, connection strings or internet egress are involved.
+
+| Flow | Path | Private |
+| --- | --- | --- |
+| Activity Log → workspace | Diagnostic setting over Microsoft's private channel (not affected by the disabled public ingestion setting) | Yes |
+| Function → Log Analytics query API (events **and** resource inventory via `arg('')`) | AMPLS private endpoint (`privatelink.monitor.azure.com`) | Yes |
+| Function → Application Insights | AMPLS private endpoint | Yes |
+| Function → Storage (report upload, host state, code package) | Private endpoints for blob, queue and table | Yes |
+| Function → Entra token | Local platform endpoint (`IDENTITY_ENDPOINT`); nothing leaves the VNet | Yes |
+| Code deployment / admin | Function `sites` private endpoint | Yes |
+| Readers → report container and workbook | Storage + AMPLS private endpoints, reached over your corporate network | Yes |
+| *Optional:* `INVENTORY_SOURCE=arm` | `management.azure.com` has no private endpoint of its own | Only with ARM Private Link or controlled egress |
+
+Design choices that follow from this:
+
+- **Flex Consumption instead of Elastic Premium.** EP1 needs an Azure Files content share, which only supports shared keys. Flex keeps host state and the code package in blob storage under the managed identity, so shared-key access is disabled on the account. It also scales to zero.
+- **REST instead of Az modules.** Managed dependencies download from powershellgallery.com and an Az sign-in calls `management.azure.com`. `run.ps1` calls the Log Analytics and Blob APIs directly with the identity token, so there is nothing to download and nothing to egress to.
+- **No ARM Private Link.** It can only be applied at the root management group (tenant-wide), is not supported by AKS and breaks Azure Bastion, so the template does not depend on it. If your tenant already uses it, `INVENTORY_SOURCE=arm` works over it unchanged.
+- **Inventory through the workspace.** `arg('')` runs inside Log Analytics (the same mechanism the workbook uses), so the Function never calls ARM. It is a Log Analytics preview feature that returns at most 1,000 rows per call; the Function pages through the results and the report shows a notice if the inventory is incomplete.
+
+### Verify private connectivity
+
+From a host on the VNet (or connected over VPN/ExpressRoute):
+
+```powershell
+nslookup <storageAccount>.blob.core.windows.net   # expect a private address from your VNet range (default 10.50.0.0/24)
+nslookup api.loganalytics.azure.com               # expect a private address as well
+./platform/Test-SlaPlatform.ps1 -ResourceGroup $rg -WorkspaceName <workspaceName>
+```
+
+Then run this once in the workspace's **Logs** blade. If it errors, the workbook inventory and the default `INVENTORY_SOURCE=loganalytics` will not work for your workspace (see [Troubleshooting](#troubleshooting)):
+
+```kusto
+arg("").resources | take 1
+```
+
 ## Prerequisites
 
 - Azure CLI 2.55+ with Bicep (`az bicep install`).
+- The `Microsoft.App` resource provider registered (`az provider register -n Microsoft.App`) and a region that supports Flex Consumption (`az functionapp list-flexconsumption-locations -o table`).
 - **Network line-of-sight to the private endpoints** for anyone deploying the Function code, reading the report, or opening the workbook (run from a host on the VNet, or via ExpressRoute/VPN/peering that can reach `vnet-sla`). The default `10.50.0.0/24` address space must not overlap your existing networks — override `vnetAddressPrefix`/`privateEndpointSubnetPrefix`/`functionSubnetPrefix` if it does.
-- **Outbound egress** from the Function subnet to `management.azure.com` and `login.microsoftonline.com` (ARG + Entra token have no Private Link). Provide it via a NAT gateway or allow these FQDNs through your firewall.
+- **No outbound internet is required** by the Function with the default `INVENTORY_SOURCE=loganalytics`. Only if you switch to `arm` must it reach `management.azure.com` (ARM Private Link, or controlled egress).
 - Permission to deploy at:
   - Resource group scope in the “hub” subscription that hosts the workspace and workbook.
   - Subscription scope in every subscription you want monitored (Owner or User Access Administrator + Monitoring Contributor).
 - The principal opening the workbook needs `Reader` on each monitored subscription. The `activity-export` module assigns this automatically when given the principal’s object id.
-- **The Function App's managed identity also needs `Reader` on every subscription it reports on** — it calls Azure Resource Graph (`Search-AzGraph`) to inventory resources for the 100% backfill. Because `main.bicep` is resource-group scoped it cannot create this subscription-level assignment; grant it after the hub deploys (step 3 below). The simplest path is to pass the Function's `functionAppPrincipalId` as the `readerPrincipalId` to `activity-export.bicep`, which covers both the workbook reader and the Function in one assignment.
+- **The Function App's managed identity also needs `Reader` on every subscription it reports on** — the inventory comes from Azure Resource Graph (`arg('')`), which evaluates the caller's permissions. Because `main.bicep` is resource-group scoped it cannot create this subscription-level assignment; grant it after the hub deploys (step 3 below). The simplest path is to pass the Function's `functionAppPrincipalId` as the `readerPrincipalId` to `activity-export.bicep`, which covers both the workbook reader and the Function in one assignment.
 
 ## Deployment
 
 Every deployment of this branch follows the **same three phases**. The only choice is *how you create the infrastructure* in Phase 1; Phases 2 and 3 are identical and mandatory because the stack is private.
 
 - **Phase 1 — Create the private infrastructure.** Pick **one** option: [Option A (portal button)](#option-a--deploy-to-azure-portal-form), [Option B (ARM JSON)](#option-b--arm-json-via-azure-cli), or [Option C (Bicep)](#option-c--bicep-source-of-truth). All three create the same resources; the deploy command itself is control-plane only and can run from anywhere.
-- **Phase 2 — Finish the setup** ([After the hub template deploys](#after-the-hub-template-deploys-required-for-all-options)). Steps 1–4: grant readers RBAC, deploy the Function code, grant the Function `Reader`, and optionally trigger a run. **Run these from a host with VNet access** — steps 1, 2 and 4 touch the private storage/Function planes.
+- **Phase 2 — Finish the setup** ([After the hub template deploys](#after-the-hub-template-deploys-required-for-all-options)). Steps 1–4: grant readers RBAC, deploy the Function code, grant the Function `Reader`, and optionally trigger a run. **Run these from a host with VNet access** — steps 2 and 4 reach the private Function endpoint (steps 1 and 3 are role assignments and run from anywhere).
 - **Phase 3 — Enroll subscriptions** ([Per-subscription enablement](#per-subscription-enablement-applies-to-all-deployment-options)). Turn on Activity Log export for each subscription you want reported.
 
 > **“VNet access”** means the machine running the command can reach `vnet-sla`'s private endpoints — a VM/build agent on that VNet, or your workstation over ExpressRoute/VPN/peering. The storage data plane and the Function SCM/admin plane are **not** reachable from the public internet on this branch.
@@ -144,7 +183,7 @@ Outputs include:
 
 The template provisions the infrastructure but does **not** push the Function code, grant report readers their RBAC, or grant the Function the subscription access it needs for the inventory. Run these steps once after deploying.
 
-> **All of the steps below must run from a host with network line-of-sight to `vnet-sla`'s private endpoints** (a VM/agent on the VNet, or your workstation over ExpressRoute/VPN). Because the Function App, storage and workspace have public access disabled, commands that touch their data/SCM planes from the public internet will fail.
+> **Steps 2 and 4 must run from a host with network line-of-sight to `vnet-sla`'s private endpoints** (a VM/agent on the VNet, or your workstation over ExpressRoute/VPN): the Function's deployment and admin endpoints are private. Steps 1 and 3 are Azure role assignments and run from anywhere.
 
 > **Set `$rg` to the resource group you actually deployed into.** `rg-sla-monitoring` is only an example. With the portal button (Option A) you pick or create the RG in the form, so it may be anything (e.g. `rg-slareport08`). With Options B/C it's the name you passed to `az group create`. If you set the wrong name here, the next commands fail with `ResourceGroupNotFound` even though a group exists — the name simply doesn't match.
 
@@ -194,7 +233,7 @@ az role assignment create `
 
 ### Step 2 — Deploy the Function code (private)
 
-The template deploys the empty Function App. Because public access and SCM basic auth are disabled, publish the PowerShell code (`run.ps1`, `function.json`, `host.json`, `profile.ps1`, `requirements.psd1`) over the **private** plane. Build the archive so `host.json` sits at the **root** of the zip.
+The template deploys the empty Function App. Flex Consumption deploys a zip package through the app's deployment endpoint (`<app>.scm.azurewebsites.net`), which is reachable only over the private endpoint, so run this from a host with VNet access. You need `Contributor` (or `Website Contributor`) on the Function App. The package contains only `host.json` and `GenerateSlaReport/` — no modules to bundle and nothing to download at runtime.
 
 > **Run these from the repo root** (the folder containing `platform/`). The `./platform/...` paths are relative, so if you're elsewhere you'll get `path '...\platform' either does not exist or is not a valid file system path`. `cd` into your clone first:
 >
@@ -204,30 +243,16 @@ The template deploys the empty Function App. Because public access and SCM basic
 
 ```powershell
 Compress-Archive -Path ./platform/function/* -DestinationPath ./platform/function-deploy.zip -Force
+
+az functionapp deployment source config-zip `
+  -g $rg -n $functionAppName --src ./platform/function-deploy.zip
 ```
 
-**Recommended — Run From Package from the private container (no SCM, no keys).** Upload the zip to a private blob the Function MI can read, then point the app at it. The MI already has `Storage Blob Data Owner/Contributor` from the template.
-
-```powershell
-# Upload the package to a private 'deploy' container (created on first use)
-az storage container create --account-name $storageAccount -n deploy --auth-mode login -o none
-az storage blob upload --account-name $storageAccount -c deploy `
-  -n function-deploy.zip -f ./platform/function-deploy.zip --auth-mode login --overwrite -o none
-
-# Point the app at the package via its (private) blob endpoint and restart
-$pkgUrl = "https://$storageAccount.blob.$((az cloud show --query suffixes.storageEndpoint -o tsv))/deploy/function-deploy.zip"
-az functionapp config appsettings set -g $rg -n $functionAppName `
-  --settings WEBSITE_RUN_FROM_PACKAGE=$pkgUrl -o none
-az functionapp restart -g $rg -n $functionAppName
-```
-
-> The Function pulls the package over its VNet integration using its managed identity — no shared keys and nothing leaves the private network. Re-upload the blob and `restart` to ship updates.
->
-> **Alternative:** run `az functionapp deployment source config-zip -g $rg -n $functionAppName --src ./platform/function-deploy.zip` from a build agent/jumpbox **on the VNet**; the SCM private endpoint accepts an Entra bearer token, so it works even with basic auth disabled.
+The zip must have `host.json` at its **root** (the command above does that). If the deployment cannot reach the endpoint, check that `nslookup $functionAppName.scm.azurewebsites.net` returns a private address from your VNet range.
 
 ### Step 3 — Grant the Function identity `Reader` on each reported subscription
 
-The Function calls Azure Resource Graph to inventory resources for the 100% backfill, which requires `Reader`. This is the same `readerPrincipalId` used in the per-subscription enablement below — pass `$functionPrincipalId` there to cover it in one shot, or grant it directly:
+The Function queries the resource inventory through Azure Resource Graph, which requires `Reader`. This is the same `readerPrincipalId` used in the per-subscription enablement below — pass `$functionPrincipalId` there to cover it in one shot, or grant it directly:
 
 ```powershell
 az role assignment create `
@@ -349,7 +374,17 @@ AppTraces
 | order by TimeGenerated desc
 ```
 
-If `Inventory resources ... : 0`, the Function identity is missing `Reader` on the subscription (step 3) or there are genuinely no matching resources.
+If `Inventory resources ... : 0`, the Function identity is missing `Reader` on the subscription (step 3) or there are genuinely no matching resources. The log line also shows the inventory source (`via loganalytics` or `via arm`).
+
+## Troubleshooting
+
+| Symptom | Cause and fix |
+| --- | --- |
+| Run fails with `Inventory through arg() failed` | The query errored. Check the Function identity has `Reader` on the subscriptions and `Log Analytics Reader` on the workspace. If `arg("").resources \| take 1` also fails in the workspace's Logs blade, `arg()` is not available for your private workspace: set `INVENTORY_SOURCE=arm` (`az functionapp config appsettings set -g $rg -n $functionAppName --settings INVENTORY_SOURCE=arm`) and give the VNet a route to `management.azure.com` (ARM Private Link or controlled egress). The workbook uses `arg()` too and has no such switch. |
+| Report shows `Inventory incomplete: X of Y` | `arg()` returned fewer rows than the total count (it is capped at 1,000 rows per call). The report is still published with this notice; file an issue with the numbers or switch to `INVENTORY_SOURCE=arm`, which pages natively. |
+| `403` or `AuthorizationPermissionMismatch` writing the report | The Function identity is missing `Storage Blob Data Owner` on the storage account (the template assigns it; role propagation can take a few minutes). |
+| Deployment command cannot connect | The host is not on the VNet or cannot resolve the private DNS zone. Verify with `nslookup $functionAppName.scm.azurewebsites.net`. |
+| Workbook or Logs blade shows connection errors in the portal | Your browser must reach the AMPLS private endpoint over your corporate network. Allow local network access for the portal in Edge/Chrome if prompted. |
 
 ## Adding or removing services
 
@@ -369,7 +404,7 @@ Re-run the script and redeploy the hub:
 az deployment group create -g $rg -f ./platform/main.bicep -p workspaceName=$workspaceName storageAccountName=$storageAccountName
 ```
 
-The static report uses an equivalent `$services` catalog embedded in [platform/function/GenerateSlaReport/run.ps1](platform/function/GenerateSlaReport/run.ps1). Keep the two lists in sync, then redeploy the Function code (step 2 in "After the hub template deploys") so the HTML/CSV report matches the workbook.
+The report uses an equivalent `$services` catalog embedded in [platform/function/GenerateSlaReport/run.ps1](platform/function/GenerateSlaReport/run.ps1). Keep the two lists in sync, then redeploy the Function code (step 2 in "After the hub template deploys") so the HTML/CSV report matches the workbook.
 
 ## Multi-subscription / multi-tenant patterns
 

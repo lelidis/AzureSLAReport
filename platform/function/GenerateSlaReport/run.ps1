@@ -8,9 +8,9 @@
 #     (ResourceId, RType, Region, ActualSLA, ExpectedSLA, SlaBasis,
 #      UnavailableMinutes, PlatformEvents)
 #   - Region x Month (12-month) availability matrix, 100% backfilled
-# Renders HTML/CSV and uploads them to a PRIVATE blob container (no public
-# static website). Authorized users read them via the Azure Portal Storage
-# browser / Storage Explorer with Storage Blob Data Reader over a private endpoint.
+# Renders HTML/CSV and writes them to a PRIVATE blob container. Everything is
+# REST with the managed identity: no Az modules, no PowerShell Gallery, no ARM
+# call (default inventory source), so the Function needs no internet egress.
 #
 # Query semantics mirror the workbook exactly:
 #   - AzureActivity / CategoryValue == 'ResourceHealth'
@@ -19,18 +19,78 @@
 #   - inventory + 100% backfill of healthy resources from Azure Resource Graph
 #
 # App settings consumed (set in main.bicep):
-#   WORKSPACE_ID      - Log Analytics customerId (GUID)
-#   STORAGE_ACCOUNT   - Storage account name
-#   REPORTS_CONTAINER - private blob container for reports (default 'reports')
-#   MATRIX_MONTHS     - default 12
+#   WORKSPACE_ID          - Log Analytics customerId (GUID)
+#   STORAGE_BLOB_ENDPOINT - Blob endpoint of the storage account
+#   REPORTS_CONTAINER     - private blob container for reports (default 'reports')
+#   MATRIX_MONTHS         - default 12
+#   INVENTORY_SOURCE      - 'loganalytics' (default, arg() in the workspace) or 'arm'
 # =============================================================================
 param($Timer)
 
 $ErrorActionPreference = 'Stop'
-$workspaceId    = $env:WORKSPACE_ID
-$storageAccount = $env:STORAGE_ACCOUNT
-$container      = if ($env:REPORTS_CONTAINER) { $env:REPORTS_CONTAINER } else { 'reports' }
-$matrixMonths   = if ($env:MATRIX_MONTHS) { [int]$env:MATRIX_MONTHS } else { 12 }
+$workspaceId     = $env:WORKSPACE_ID
+$blobEndpoint    = $env:STORAGE_BLOB_ENDPOINT
+$container       = if ($env:REPORTS_CONTAINER) { $env:REPORTS_CONTAINER } else { 'reports' }
+$matrixMonths    = if ($env:MATRIX_MONTHS) { [int]$env:MATRIX_MONTHS } else { 12 }
+$inventorySource = if ($env:INVENTORY_SOURCE) { $env:INVENTORY_SOURCE } else { 'loganalytics' }
+if (-not $workspaceId -or -not $blobEndpoint) { throw 'WORKSPACE_ID and STORAGE_BLOB_ENDPOINT app settings are required.' }
+
+$script:tokens = @{}
+
+# Managed identity token; the az CLI branch exists only for local testing.
+function Get-AccessToken([string]$Resource) {
+    $cached = $script:tokens[$Resource]
+    if ($cached -and $cached.Expires -gt [datetime]::UtcNow.AddMinutes(5)) { return $cached.Value }
+    if ($env:IDENTITY_ENDPOINT) {
+        $uri = '{0}?resource={1}&api-version=2019-08-01' -f $env:IDENTITY_ENDPOINT, [uri]::EscapeDataString($Resource)
+        $r = Invoke-RestMethod -Uri $uri -Headers @{ 'X-IDENTITY-HEADER' = $env:IDENTITY_HEADER }
+        $token = @{ Value = $r.access_token; Expires = [datetimeoffset]::FromUnixTimeSeconds([long]$r.expires_on).UtcDateTime }
+    } else {
+        $token = @{ Value = (az account get-access-token --resource $Resource --query accessToken -o tsv); Expires = [datetime]::UtcNow.AddMinutes(30) }
+    }
+    $script:tokens[$Resource] = $token
+    return $token.Value
+}
+
+# Retries throttling and transient failures; anything else fails the run.
+function Invoke-Rest {
+    param([string]$Method, [string]$Uri, [string]$Resource, $Body, [hashtable]$Headers = @{}, [string]$ContentType = 'application/json')
+    $h = @{ Authorization = 'Bearer ' + (Get-AccessToken $Resource) } + $Headers
+    for ($try = 1; ; $try++) {
+        try {
+            return Invoke-RestMethod -Method $Method -Uri $Uri -Headers $h -ContentType $ContentType -Body $Body
+        } catch {
+            $code = if ($_.Exception.Response) { [int]$_.Exception.Response.StatusCode } else { 0 }
+            if ($try -ge 4 -or $code -notin 0, 429, 500, 502, 503, 504) {
+                throw "$Method $Uri failed (HTTP $code): $($_.ErrorDetails.Message) $($_.Exception.Message)"
+            }
+            Start-Sleep -Seconds (5 * $try)
+        }
+    }
+}
+
+# 'Prefer: wait' lifts the default 3-minute server-side query timeout.
+function Invoke-LaQuery([string]$Kql) {
+    $body = @{ query = $Kql } | ConvertTo-Json -Compress
+    $r = Invoke-Rest -Method Post -Uri "https://api.loganalytics.azure.com/v1/workspaces/$workspaceId/query" `
+        -Resource 'https://api.loganalytics.io' -Body $body -Headers @{ Prefer = 'wait=600' }
+    if ($r.error) { throw "Log Analytics query error: $($r.error.message)" }
+    $cols = @($r.tables[0].columns | ForEach-Object { $_.name })
+    foreach ($row in $r.tables[0].rows) {
+        $o = [ordered]@{}
+        for ($i = 0; $i -lt $cols.Count; $i++) { $o[$cols[$i]] = $row[$i] }
+        [pscustomobject]$o
+    }
+}
+
+function Publish-Blob([string]$Name, [string]$Content, [string]$ContentType) {
+    $uri = '{0}/{1}/{2}' -f $blobEndpoint.TrimEnd('/'), $container, $Name
+    $headers = @{ 'x-ms-version' = '2023-11-03'; 'x-ms-blob-type' = 'BlockBlob'; 'x-ms-blob-content-type' = $ContentType }
+    Invoke-Rest -Method Put -Uri $uri -Resource 'https://storage.azure.com/' -ContentType $ContentType -Headers $headers `
+        -Body ([System.Text.Encoding]::UTF8.GetBytes($Content)) | Out-Null
+}
+
+function ConvertTo-HtmlText($Value) { [System.Net.WebUtility]::HtmlEncode([string]$Value) }
 
 $now    = [datetime]::UtcNow
 $report = $now.AddMonths(-1).ToString('yyyy-MM')
@@ -109,24 +169,54 @@ $tokenArray = '[' + (($services | ForEach-Object { "'" + $_.token + "'" }) -join
 
 # -----------------------------------------------------------------------------
 # 1. Inventory from Azure Resource Graph (real region + RType, 100% backfill base)
+#    loganalytics: arg('') runs inside the private workspace, no ARM call.
+#    arm:          ARG REST on management.azure.com (needs ARM reachability).
 # -----------------------------------------------------------------------------
-$invQuery = "resources | where type in~ ($argList) | project ResourceId = tolower(id), Region = tostring(location), ArgType = tolower(type)"
+$invFilter = "tolower(type) in ($argList)"
+$invProject = 'project ResourceId = tolower(id), Region = tostring(location), ArgType = tolower(type)'
 $inventory = [System.Collections.Generic.List[object]]::new()
-$skipToken = $null
-do {
-    if ($skipToken) { $page = Search-AzGraph -Query $invQuery -First 1000 -SkipToken $skipToken }
-    else            { $page = Search-AzGraph -Query $invQuery -First 1000 }
-    foreach ($r in $page) {
-        $rt = $argToRType[$r.ArgType]
-        $inventory.Add([pscustomobject]@{
-            ResourceId = $r.ResourceId
-            Region     = $r.Region
-            RType      = if ($rt) { $rt } else { 'Other' }
-        })
+
+function Add-InventoryRow($ResourceId, $Region, $ArgType) {
+    $rt = $argToRType[$ArgType]
+    $inventory.Add([pscustomobject]@{ ResourceId = $ResourceId; Region = $Region; RType = if ($rt) { $rt } else { 'Other' } })
+}
+
+if ($inventorySource -eq 'arm') {
+    $skipToken = $null
+    do {
+        $options = @{ '$top' = 1000 }
+        if ($skipToken) { $options['$skipToken'] = $skipToken }
+        $body = @{ query = "resources | where $invFilter | $invProject"; options = $options } | ConvertTo-Json -Compress
+        $page = Invoke-Rest -Method Post -Uri 'https://management.azure.com/providers/Microsoft.ResourceGraph/resources?api-version=2022-10-01' `
+            -Resource 'https://management.azure.com/' -Body $body
+        foreach ($r in $page.data) { Add-InventoryRow $r.ResourceId $r.Region $r.ArgType }
+        $skipToken = $page.'$skipToken'
+    } while ($skipToken)
+    $expectedCount = $inventory.Count
+} else {
+    try {
+        # arg('') returns at most 1000 rows, so page with a keyset cursor (strcmp: KQL has no string '>').
+        $cursor = ''
+        for ($page = 0; $page -lt 500; $page++) {
+            $escaped = $cursor.Replace('\', '\\').Replace("'", "\'")
+            $rows = @(Invoke-LaQuery "arg('').resources | where $invFilter | $invProject | where strcmp(ResourceId, '$escaped') > 0 | order by ResourceId asc | take 1000")
+            foreach ($r in $rows) { Add-InventoryRow $r.ResourceId $r.Region $r.ArgType }
+            if ($rows.Count -lt 1000) { break }
+            $cursor = $rows[-1].ResourceId
+        }
+        $expectedCount = [int]@(Invoke-LaQuery "arg('').resources | where $invFilter | summarize n = count()")[0].n
+    } catch {
+        throw "Inventory through arg() failed: $($_.Exception.Message). Check the Function identity has Reader on the subscriptions; if arg() is blocked for this private workspace, set INVENTORY_SOURCE=arm (needs ARM reachability)."
     }
-    $skipToken = $page.SkipToken
-} while ($skipToken)
-Write-Host "Inventory resources (all selected types): $($inventory.Count)"
+}
+$inventoryNote = ''
+if ($inventory.Count -eq 0) {
+    $inventoryNote = 'No resources found: grant the Function identity Reader on the subscriptions to report.'
+} elseif ($inventory.Count -ne $expectedCount) {
+    $inventoryNote = "Inventory incomplete: $($inventory.Count) of $expectedCount resources listed."
+}
+if ($inventoryNote) { Write-Warning $inventoryNote }
+Write-Host "Inventory resources (all selected types): $($inventory.Count) via $inventorySource"
 
 # -----------------------------------------------------------------------------
 # 2. Downtime seconds per resource per month from Log Analytics
@@ -159,7 +249,7 @@ evtraw
 | summarize DownSec = sumif(datetime_diff('second', SegEnd, SegStart), IsDown) by ResourceId, Month
 "@
 
-$downRaw = (Invoke-AzOperationalInsightsQuery -WorkspaceId $workspaceId -Query $kqlDown).Results
+$downRaw = @(Invoke-LaQuery $kqlDown)
 $downMap = @{}
 foreach ($d in $downRaw) { $downMap["$($d.ResourceId)|$($d.Month)"] = [double]$d.DownSec }
 
@@ -184,7 +274,7 @@ AzureActivity
 | summarize PlatformEvents = count() by ResourceId, Month
 "@
 
-$evtRaw = (Invoke-AzOperationalInsightsQuery -WorkspaceId $workspaceId -Query $kqlEvents).Results
+$evtRaw = @(Invoke-LaQuery $kqlEvents)
 $evtMap = @{}
 foreach ($e in $evtRaw) { $evtMap["$($e.ResourceId)|$($e.Month)"] = [int]$e.PlatformEvents }
 
@@ -251,17 +341,21 @@ $mBody = ($matrix | ForEach-Object {
             "<td class='$cls'>$([string]::Format('{0:F4}%', $v))</td>"
         }
     }
-    "<tr><td class='region'>$($r.Region)</td>$(-join $cells)</tr>"
+    "<tr><td class='region'>$(ConvertTo-HtmlText $r.Region)</td>$(-join $cells)</tr>"
 }) -join "`n"
 
 $rRows = ($perRes | Sort-Object _SlaValue, @{Expression='UnavailableMinutes';Descending=$true} | ForEach-Object {
-    "<tr><td>$($_.ResourceId)</td><td>$($_.RType)</td><td>$($_.Region)</td><td>$($_.ActualSLA)</td><td>$($_.ExpectedSLA)</td><td>$($_.SlaBasis)</td><td>$($_.UnavailableMinutes)</td><td>$($_.PlatformEvents)</td></tr>"
+    $cells = $_.ResourceId, $_.RType, $_.Region, $_.ActualSLA, $_.ExpectedSLA, $_.SlaBasis, $_.UnavailableMinutes, $_.PlatformEvents | ForEach-Object { "<td>$(ConvertTo-HtmlText $_)</td>" }
+    "<tr>$(-join $cells)</tr>"
 }) -join "`n"
+
+$noticeHtml = if ($inventoryNote) { "<p style='background:#fff4ce;padding:8px'><b>Note:</b> $(ConvertTo-HtmlText $inventoryNote)</p>" } else { '' }
 
 $html = @"
 <!doctype html><html><head><meta charset='utf-8'><title>Azure Availability SLA $report</title>$style</head><body>
 <h1>Azure Availability SLA</h1>
 <div>Reporting month: <b>$report</b> &nbsp;|&nbsp; Generated: $($now.ToString('u')) &nbsp;|&nbsp; Resources: $($inventory.Count)</div>
+$noticeHtml
 <h2>Cumulative Uptime per Region per Month (last $matrixMonths months)</h2>
 <table class='matrix'><thead>$mHead</thead><tbody>$mBody</tbody></table>
 <h2>Per-resource platform SLA ($report)</h2>
@@ -270,25 +364,14 @@ $html = @"
 "@
 
 # -----------------------------------------------------------------------------
-# 7. Upload to the PRIVATE reports container (Entra/RBAC, no keys, no $web)
+# 7. Upload to the PRIVATE reports container (Entra/RBAC)
 # -----------------------------------------------------------------------------
-$tmp = $env:TEMP
-$htmlFile  = Join-Path $tmp "AzSla_$report.html"
-$csvFile   = Join-Path $tmp "AzSla_$report.csv"
-$matrixCsv = Join-Path $tmp "AzSla_RegionMatrix_$report.csv"
-$indexFile = Join-Path $tmp 'index.html'
+$perResCsv = (@($perRes | Select-Object ResourceId, RType, Region, ActualSLA, ExpectedSLA, SlaBasis, UnavailableMinutes, PlatformEvents) | ConvertTo-Csv -NoTypeInformation) -join "`r`n"
+$matrixCsv = (@($matrix) | ConvertTo-Csv -NoTypeInformation) -join "`r`n"
 
-$html | Out-File $htmlFile  -Encoding UTF8
-$perRes | Select-Object ResourceId, RType, Region, ActualSLA, ExpectedSLA, SlaBasis, UnavailableMinutes, PlatformEvents |
-    Export-Csv $csvFile -NoTypeInformation -Encoding UTF8
-$matrix | Export-Csv $matrixCsv -NoTypeInformation -Encoding UTF8
-$html | Out-File $indexFile -Encoding UTF8
+Publish-Blob "AzSla_$report.html" $html 'text/html'
+Publish-Blob "AzSla_$report.csv" $perResCsv 'text/csv'
+Publish-Blob "AzSla_RegionMatrix_$report.csv" $matrixCsv 'text/csv'
+Publish-Blob 'index.html' $html 'text/html'
 
-$ctx = New-AzStorageContext -StorageAccountName $storageAccount -UseConnectedAccount
-foreach ($f in @($htmlFile, $csvFile, $matrixCsv, $indexFile)) {
-    $ct = if ($f.EndsWith('.html')) { 'text/html' } else { 'text/csv' }
-    Set-AzStorageBlobContent -Context $ctx -Container $container -File $f -Blob (Split-Path $f -Leaf) `
-        -Properties @{ContentType=$ct} -Force | Out-Null
-}
-
-Write-Host "Report published to private container '$container' on storage '$storageAccount' (index.html). Read it via the Azure Portal Storage browser or Storage Explorer with Storage Blob Data Reader."
+Write-Host "Report published to private container '$container' (index.html). Read it via the Azure Portal Storage browser or Storage Explorer with Storage Blob Data Reader."
