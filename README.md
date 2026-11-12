@@ -429,6 +429,22 @@ The Functions use an equivalent catalog (`$script:ServiceCatalog`) in [platform/
 - For many subscriptions, wrap step 2 in a loop or use Azure Policy `DeployIfNotExists` for `Microsoft.Insights/diagnosticSettings` at management-group scope so newly created subscriptions auto-enroll.
 - For multi-tenant, deploy the hub once per tenant; subscription-level enablement and the `Reader` assignment must be repeated in each tenant.
 
+## Remove the deployment
+
+1. For every enrolled subscription, delete the Activity Log export and the Function's `Reader` assignment:
+
+   ```powershell
+   az monitor diagnostic-settings subscription delete --name to-sla-workspace --yes
+   az role assignment delete --assignee $functionPrincipalId --role Reader --scope /subscriptions/<subscriptionId>
+   ```
+
+2. Delete the resource group: `az group delete -n $rg --yes`. The Flex Consumption app releases its subnet asynchronously, so the virtual network (and the NAT gateway) can take a few minutes to disappear.
+3. A deleted workspace stays recoverable for 14 days. To remove it immediately, unlink it from the AMPLS first and then delete it with `--force`; a workspace that is still scoped in an AMPLS cannot be force-deleted:
+
+   ```powershell
+   az monitor private-link-scope scoped-resource delete -g $rg --scope-name ampls-sla -n scoped-<workspaceName> --yes
+   az monitor log-analytics workspace delete -g $rg -n <workspaceName> --force true --yes
+   ```
 ## Notes and limitations
 
 - The workbook reads `AzureActivity` (`ResourceHealth` + optional `Administrative`). It does not require per-resource diagnostic settings.
