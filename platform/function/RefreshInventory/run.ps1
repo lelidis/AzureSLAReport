@@ -43,7 +43,8 @@ if ($inventory.Count -eq 0) {
 
 $snapshot = [datetime]::UtcNow.ToString('o')
 $uri = '{0}/dataCollectionRules/{1}/streams/{2}?api-version=2023-01-01' -f $endpoint.TrimEnd('/'), $ruleId, $stream
-$chunkSize = 2000
+# The Logs Ingestion API accepts at most 1 MB per call; 1,000 rows stay far below it even with long resource IDs.
+$chunkSize = 1000
 for ($i = 0; $i -lt $inventory.Count; $i += $chunkSize) {
     $last = [math]::Min($i + $chunkSize, $inventory.Count) - 1
     $rows = foreach ($r in $inventory[$i..$last]) {
