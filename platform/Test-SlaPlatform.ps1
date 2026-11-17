@@ -12,9 +12,9 @@ $ErrorActionPreference = 'Continue'
 $results = New-Object System.Collections.Generic.List[object]
 
 function Add-Check {
-    param([string]$Name, [bool]$Ok, [string]$Detail)
+    param([string]$Name, [bool]$Ok, [string]$Detail, [switch]$Skip)
     $status = 'FAIL'
-    if ($Ok) { $status = 'PASS' }
+    if ($Skip) { $status = 'SKIP' } elseif ($Ok) { $status = 'PASS' }
     $results.Add([pscustomobject]@{ Check = $Name; Status = $status; Detail = $Detail })
 }
 
@@ -88,18 +88,27 @@ if ($fn) {
     $netOk = ($fn.publicNetworkAccess -eq 'Disabled') -and [bool]$fn.virtualNetworkSubnetId
     Add-Check '4c. Function private + VNet-integrated' $netOk "publicNetworkAccess=$($fn.publicNetworkAccess); kind=$($fn.kind)"
 
-    # 4d. Function subnet egress is locked down: NSG attached, no default outbound access.
-    # The NAT gateway is the single path to Azure Resource Manager (absent if deployed with deployNatGateway=false).
-    $subId = az account show --query id -o tsv
-    $snet = FromJson (az rest --method get --uri "https://management.azure.com/subscriptions/$subId/resourceGroups/$ResourceGroup/providers/Microsoft.Network/virtualNetworks/vnet-sla/subnets/snet-functions?api-version=2023-11-01" 2>$null)
+    # 4d. The subnet the Function is integrated with must be delegated to Microsoft.App/environments.
+    # For the vnet-sla subnet this template creates, egress must also be locked down (NSG attached, no
+    # default outbound access; the NAT gateway is the single path to Azure Resource Manager). An existing
+    # subnet is yours: its egress to management.azure.com is not checked here.
+    $subnetId = [string]$fn.virtualNetworkSubnetId
+    $ownSubnet = $subnetId -match ('/resourceGroups/' + [regex]::Escape($ResourceGroup) + '/providers/Microsoft.Network/virtualNetworks/vnet-sla/subnets/snet-functions$')
+    $snet = $null
+    if ($subnetId) { $snet = FromJson (az rest --method get --uri "https://management.azure.com$($subnetId)?api-version=2023-11-01" 2>$null) }
+    $name4d = '4d. Function subnet delegated' + (Pick $ownSubnet ' + egress locked (NSG, no default outbound)' '')
     if ($snet) {
         $p = $snet.properties
+        $delegated = [bool](@($p.delegations) | Where-Object { $_.properties.serviceName -eq 'Microsoft.App/environments' })
         $hasNsg = [bool]$p.networkSecurityGroup
         $hasNat = [bool]$p.natGateway
-        $egressOk = $hasNsg -and ($p.defaultOutboundAccess -eq $false)
-        Add-Check '4d. Function subnet egress locked (NSG, no default outbound)' $egressOk "nsg=$hasNsg; defaultOutboundAccess=$($p.defaultOutboundAccess); natGateway=$hasNat"
+        $subnetOk = $delegated
+        if ($ownSubnet) { $subnetOk = $delegated -and $hasNsg -and ($p.defaultOutboundAccess -eq $false) }
+        Add-Check $name4d $subnetOk "$($snet.id.Split('/')[-3])/$($snet.name); delegated=$delegated; nsg=$hasNsg; defaultOutboundAccess=$($p.defaultOutboundAccess); natGateway=$hasNat"
+    } elseif ($ownSubnet) {
+        Add-Check $name4d $false 'subnet snet-functions not found'
     } else {
-        Add-Check '4d. Function subnet egress locked (NSG, no default outbound)' $false 'subnet snet-functions not found'
+        Add-Check $name4d $false "existing subnet not readable with this identity; verify delegation to Microsoft.App/environments and egress to management.azure.com yourself" -Skip
     }
 }
 
@@ -189,15 +198,20 @@ AzureActivity
     }
 }
 
-# 10. Private endpoints (storage blob/queue/table, function sites, AMPLS) approved
+# 10. Private endpoints approved: storage blob/queue/table + function sites, plus the Azure Monitor
+# Private Link scope endpoint (absent when an existing scope is used; its endpoint lives with the scope)
 $pes = @(FromJson (az network private-endpoint list -g $ResourceGroup 2>$null))
 $approved = @($pes | Where-Object { $_.privateLinkServiceConnections[0].privateLinkServiceConnectionState.status -eq 'Approved' }).Count
-Add-Check '10. Private endpoints approved' ($pes.Count -ge 5 -and $approved -eq $pes.Count) "$approved of $($pes.Count) approved (expected 5)"
+Add-Check '10. Private endpoints approved' ($pes.Count -ge 4 -and $approved -eq $pes.Count) "$approved of $($pes.Count) approved (expected 5, or 4 with an existing Private Link scope)"
 
 $results | Format-Table -AutoSize
 $failCount = @($results | Where-Object { $_.Status -eq 'FAIL' }).Count
+$skipCount = @($results | Where-Object { $_.Status -eq 'SKIP' }).Count
 if ($failCount -gt 0) {
     Write-Host "`n$failCount check(s) FAILED. Address those before relying on the report." -ForegroundColor Yellow
 } else {
     Write-Host "`nAll checks passed." -ForegroundColor Green
+}
+if ($skipCount -gt 0) {
+    Write-Host "$skipCount check(s) skipped: see the Detail column." -ForegroundColor Yellow
 }

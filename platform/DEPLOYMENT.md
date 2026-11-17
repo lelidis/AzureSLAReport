@@ -6,7 +6,8 @@ The deployment guide is the [README](../README.md#deployment). This branch deplo
 
 ```
 platform/
-├─ main.bicep                       # RG scope: workspace + inventory table, App Insights, AMPLS, DCE/DCR, VNet + NSG/NAT, private endpoints, storage, Flex Function, workbook
+├─ main.bicep                       # RG scope: workspace + inventory table, App Insights, AMPLS, DCE/DCR, VNet + NSG/NAT, private endpoints, storage, Flex Function, workbook (each network piece can be an existing one)
+├─ ampls-link.bicep                 # module: adds a workspace/App Insights/DCE to a Private Link scope, also one in another RG or subscription
 ├─ activity-export.bicep            # subscription scope: Activity Log -> workspace, Reader for the report identity
 ├─ policy-resource-health.bicep     # optional management-group policy that enrolls subscriptions automatically
 ├─ inject-queries.ps1               # service catalog and workbook query generator
@@ -32,6 +33,10 @@ platform/
 | Monthly report | `Storage Blob Data Reader` | The storage account (or the `reports` container) |
 
 Both surfaces require a network path to the private endpoints (corporate VPN/ExpressRoute with resolvable private DNS).
+
+## Existing network, Private Link scope and private DNS
+
+`main.bicep` can reuse an existing VNet, Azure Monitor Private Link scope and private DNS zones, including ones in other subscriptions. See [Use an existing network, Private Link scope and private DNS zones](../README.md#use-an-existing-network-private-link-scope-and-private-dns-zones) for the parameters, prerequisites and permissions.
 
 ## Cost guardrails
 

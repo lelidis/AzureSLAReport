@@ -13,6 +13,11 @@
 //
 //  Needs the Microsoft.App provider registered and a Flex Consumption region
 //  (`az functionapp list-flexconsumption-locations`).
+//
+//  Optional: reuse an existing VNet (existing*SubnetId), Azure Monitor Private Link
+//  Scope (existingAmplsResourceId) and private DNS zones (existingPrivateDnsZoneIds),
+//  also from other resource groups or subscriptions. See README "Use an existing
+//  network, Private Link scope and private DNS zones".
 // ============================================================================
 
 @description('Azure region for all resources. Must support Flex Consumption.')
@@ -43,17 +48,32 @@ param reportsContainerName string = 'reports'
 @description('Private blob container that Flex Consumption uses for the deployed code package.')
 param deploymentContainerName string = 'app-package'
 
-@description('Create a NAT gateway for the Function subnet. The Function reads the resource inventory from Azure Resource Graph through management.azure.com, which has no private endpoint: this single flow leaves through the NAT gateway while the subnet NSG only allows the AzureResourceManager service tag. Set false only if you provide the same egress yourself (hub firewall/UDR to management.azure.com, or ARM Private Link).')
+@description('Create a NAT gateway for the Function subnet. The Function reads the resource inventory from Azure Resource Graph through management.azure.com, which has no private endpoint: this single flow leaves through the NAT gateway while the subnet NSG only allows the AzureResourceManager service tag. Set false only if you provide the same egress yourself (hub firewall/UDR to management.azure.com, or ARM Private Link). Ignored when an existing VNet is used.')
 param deployNatGateway bool = true
 
-@description('Address space for the VNet hosting private endpoints + Function integration.')
+@description('Address space for the VNet hosting private endpoints + Function integration (ignored when an existing VNet is used).')
 param vnetAddressPrefix string = '10.50.0.0/24'
 
-@description('Subnet for private endpoints.')
+@description('Subnet for private endpoints (ignored when an existing VNet is used).')
 param privateEndpointSubnetPrefix string = '10.50.0.0/26'
 
-@description('Delegated subnet for Function VNet integration (Flex Consumption: /27 minimum, /26 recommended).')
+@description('Delegated subnet for Function VNet integration (Flex Consumption: /27 minimum, /26 recommended; ignored when an existing VNet is used).')
 param functionSubnetPrefix string = '10.50.0.64/26'
+
+@description('Existing subnet for the private endpoints (resource ID, any resource group or subscription). Set it together with existingFunctionSubnetId to use an existing VNet; leave both empty to create vnet-sla. The deployment identity needs Microsoft.Network/virtualNetworks/subnets/join/action on it.')
+param existingPrivateEndpointSubnetId string = ''
+
+@description('Existing subnet for the Function VNet integration (resource ID). Must be in the Function region, delegated to Microsoft.App/environments, /27 or larger and not used by anything else. The template does not change it, so it must already allow outbound HTTPS to management.azure.com (NAT gateway, hub firewall/UDR or ARM Private Link).')
+param existingFunctionSubnetId string = ''
+
+@description('Existing Azure Monitor Private Link Scope (resource ID, any resource group or subscription). When set, the workspace, Application Insights and the data collection endpoint are added to it and no scope or scope private endpoint is created; the scope, its private endpoint and its DNS must already serve the Function VNet. The deployment identity needs Contributor (or scopedResources/write plus deployments/write) on the scope resource group.')
+param existingAmplsResourceId string = ''
+
+@description('Create private DNS zone groups on the private endpoints. Set false when DNS records are created by policy or central DNS; no zones are created either.')
+param createPrivateDnsZoneGroups bool = true
+
+@description('Existing private DNS zones by key (blob, queue, table, sites, monitor, oms, ods, agentsvc), each a resource ID that can be in another subscription. A listed zone is used as is and must already be linked to (or resolvable from) the Function VNet; the deployment identity needs Private DNS Zone Contributor on it. Every key left out is created here and linked to the VNet.')
+param existingPrivateDnsZoneIds object = {}
 
 @description('Tag applied to all resources.')
 param tags object = {
@@ -62,6 +82,11 @@ param tags object = {
 }
 
 var storageSuffix = environment().suffixes.storage
+
+// Both existing subnets are needed to reuse a VNet; otherwise vnet-sla is created.
+var useExistingVnet = !empty(existingPrivateEndpointSubnetId) && !empty(existingFunctionSubnetId)
+var createNatGateway = !useExistingVnet && deployNatGateway
+var existingFunctionVnetId = useExistingVnet ? first(split(existingFunctionSubnetId, '/subnets/')) : ''
 
 // ---------------------------------------------------------------------------
 // Log Analytics workspace (private ingestion + query only)
@@ -102,8 +127,9 @@ resource appInsights 'Microsoft.Insights/components@2020-02-02' = {
 // Manager (the Azure Resource Graph inventory): management.azure.com has no
 // private endpoint, so that flow leaves through a NAT gateway and the NSG blocks
 // every other internet destination. The subnet has no default outbound access.
+// With an existing VNet none of this is created: the subnet owner provides the egress.
 // ---------------------------------------------------------------------------
-resource nsgFunctions 'Microsoft.Network/networkSecurityGroups@2023-11-01' = {
+resource nsgFunctions 'Microsoft.Network/networkSecurityGroups@2023-11-01' = if (!useExistingVnet) {
   name: 'nsg-sla-functions'
   location: location
   tags: tags
@@ -139,7 +165,7 @@ resource nsgFunctions 'Microsoft.Network/networkSecurityGroups@2023-11-01' = {
   }
 }
 
-resource natIp 'Microsoft.Network/publicIPAddresses@2023-11-01' = if (deployNatGateway) {
+resource natIp 'Microsoft.Network/publicIPAddresses@2023-11-01' = if (createNatGateway) {
   name: 'pip-nat-sla'
   location: location
   tags: tags
@@ -147,7 +173,7 @@ resource natIp 'Microsoft.Network/publicIPAddresses@2023-11-01' = if (deployNatG
   properties: { publicIPAllocationMethod: 'Static' }
 }
 
-resource natGateway 'Microsoft.Network/natGateways@2023-11-01' = if (deployNatGateway) {
+resource natGateway 'Microsoft.Network/natGateways@2023-11-01' = if (createNatGateway) {
   name: 'nat-sla'
   location: location
   tags: tags
@@ -161,7 +187,7 @@ resource natGateway 'Microsoft.Network/natGateways@2023-11-01' = if (deployNatGa
 // ---------------------------------------------------------------------------
 // Virtual network: one subnet for private endpoints, one delegated to Flex
 // ---------------------------------------------------------------------------
-resource vnet 'Microsoft.Network/virtualNetworks@2023-11-01' = {
+resource vnet 'Microsoft.Network/virtualNetworks@2023-11-01' = if (!useExistingVnet) {
   name: 'vnet-sla'
   location: location
   tags: tags
@@ -181,7 +207,7 @@ resource vnet 'Microsoft.Network/virtualNetworks@2023-11-01' = {
           addressPrefix: functionSubnetPrefix
           defaultOutboundAccess: false
           networkSecurityGroup: { id: nsgFunctions.id }
-          natGateway: deployNatGateway ? { id: natGateway.id } : null
+          natGateway: createNatGateway ? { id: natGateway.id } : null
           delegations: [
             {
               name: 'flexconsumption'
@@ -204,21 +230,27 @@ resource funcSubnet 'Microsoft.Network/virtualNetworks/subnets@2023-11-01' exist
   name: 'snet-functions'
 }
 
+var peSubnetId = useExistingVnet ? existingPrivateEndpointSubnetId : peSubnet.id
+var funcSubnetId = useExistingVnet ? existingFunctionSubnetId : funcSubnet.id
+
 // ---------------------------------------------------------------------------
 // Private DNS zones (+ VNet links). Index order is referenced below.
 //   0 blob | 1 queue | 2 table | 3 sites
 //   4 monitor | 5 oms | 6 ods | 7 agentsvc
-// Enterprises with centralized DNS can remove these and link existing zones.
+// A zone listed in existingPrivateDnsZoneIds (any subscription) is used as is and
+// must already be linked to / resolvable from the Function VNet. Every other zone
+// is created here and linked to the VNet. createPrivateDnsZoneGroups=false creates
+// no zones and no zone groups (records come from policy / central DNS).
 // ---------------------------------------------------------------------------
-var privateDnsZoneNames = [
-  'privatelink.blob.${storageSuffix}'
-  'privatelink.queue.${storageSuffix}'
-  'privatelink.table.${storageSuffix}'
-  'privatelink.azurewebsites.net'
-  'privatelink.monitor.azure.com'
-  'privatelink.oms.opinsights.azure.com'
-  'privatelink.ods.opinsights.azure.com'
-  'privatelink.agentsvc.azure-automation.net'
+var privateDnsZones = [
+  { key: 'blob', name: 'privatelink.blob.${storageSuffix}' }
+  { key: 'queue', name: 'privatelink.queue.${storageSuffix}' }
+  { key: 'table', name: 'privatelink.table.${storageSuffix}' }
+  { key: 'sites', name: 'privatelink.azurewebsites.net' }
+  { key: 'monitor', name: 'privatelink.monitor.azure.com' }
+  { key: 'oms', name: 'privatelink.oms.opinsights.azure.com' }
+  { key: 'ods', name: 'privatelink.ods.opinsights.azure.com' }
+  { key: 'agentsvc', name: 'privatelink.agentsvc.azure-automation.net' }
 ]
 var zBlob = 0
 var zSites = 3
@@ -227,21 +259,26 @@ var zOms = 5
 var zOds = 6
 var zAgent = 7
 
-resource dnsZones 'Microsoft.Network/privateDnsZones@2020-06-01' = [for name in privateDnsZoneNames: {
-  name: name
+var zoneProvided = [for z in privateDnsZones: contains(existingPrivateDnsZoneIds, z.key) ? !empty(existingPrivateDnsZoneIds[z.key]) : false]
+var zoneLinkVnetId = useExistingVnet ? existingFunctionVnetId : vnet.id
+
+resource dnsZones 'Microsoft.Network/privateDnsZones@2020-06-01' = [for (z, i) in privateDnsZones: if (createPrivateDnsZoneGroups && !zoneProvided[i]) {
+  name: z.name
   location: 'global'
   tags: tags
 }]
 
-resource dnsLinks 'Microsoft.Network/privateDnsZones/virtualNetworkLinks@2020-06-01' = [for (name, i) in privateDnsZoneNames: {
+resource dnsLinks 'Microsoft.Network/privateDnsZones/virtualNetworkLinks@2020-06-01' = [for (z, i) in privateDnsZones: if (createPrivateDnsZoneGroups && !zoneProvided[i]) {
   parent: dnsZones[i]
   name: 'link-vnet-sla'
   location: 'global'
   properties: {
     registrationEnabled: false
-    virtualNetwork: { id: vnet.id }
+    virtualNetwork: { id: zoneLinkVnetId }
   }
 }]
+
+var dnsZoneIds = [for (z, i) in privateDnsZones: zoneProvided[i] ? existingPrivateDnsZoneIds[z.key] : dnsZones[i].id]
 
 // ---------------------------------------------------------------------------
 // Storage account: PRIVATE and KEYLESS. Hosts the report container, the Flex
@@ -298,7 +335,7 @@ resource peStorage 'Microsoft.Network/privateEndpoints@2023-11-01' = [for ep in 
   location: location
   tags: tags
   properties: {
-    subnet: { id: peSubnet.id }
+    subnet: { id: peSubnetId }
     privateLinkServiceConnections: [
       {
         name: ep.group
@@ -311,23 +348,38 @@ resource peStorage 'Microsoft.Network/privateEndpoints@2023-11-01' = [for ep in 
   }
 }]
 
-resource peStorageDns 'Microsoft.Network/privateEndpoints/privateDnsZoneGroups@2023-11-01' = [for (ep, i) in storageEndpoints: {
+resource peStorageDns 'Microsoft.Network/privateEndpoints/privateDnsZoneGroups@2023-11-01' = [for (ep, i) in storageEndpoints: if (createPrivateDnsZoneGroups) {
   parent: peStorage[i]
   name: 'default'
   properties: {
     privateDnsZoneConfigs: [
-      { name: ep.group, properties: { privateDnsZoneId: dnsZones[ep.zone].id } }
+      { name: ep.group, properties: { privateDnsZoneId: dnsZoneIds[ep.zone] } }
     ]
   }
 }]
 
 // ---------------------------------------------------------------------------
-// Azure Monitor Private Link Scope (AMPLS) for LAW + App Insights (GA API).
+// Azure Monitor Private Link Scope (AMPLS) for LAW + App Insights + the data
+// collection endpoint (GA API). With existingAmplsResourceId the three resources
+// are added to that scope (any resource group or subscription) and no scope or
+// scope private endpoint is created here.
 // Diagnostic-settings / Activity Log delivery to the workspace uses Microsoft's
 // private channel and is not blocked by the disabled public ingestion setting.
 // ---------------------------------------------------------------------------
-resource ampls 'Microsoft.Insights/privateLinkScopes@2021-09-01' = {
-  name: 'ampls-sla'
+var useExistingAmpls = !empty(existingAmplsResourceId)
+var amplsIdParts = split(existingAmplsResourceId, '/')
+var amplsSubscriptionId = useExistingAmpls ? amplsIdParts[2] : subscription().subscriptionId
+var amplsResourceGroup = useExistingAmpls ? amplsIdParts[4] : resourceGroup().name
+var amplsName = useExistingAmpls ? last(amplsIdParts) : 'ampls-sla'
+
+// A shared scope can hold several deployments: make the scoped resource names unique per resource group.
+var scopedNameSuffix = uniqueString(resourceGroup().id)
+var scopedWorkspaceName = useExistingAmpls ? 'scoped-${take(workspaceName, 30)}-${scopedNameSuffix}' : 'scoped-${workspaceName}'
+var scopedAppInsightsName = useExistingAmpls ? 'scoped-appi-sla-${scopedNameSuffix}' : 'scoped-appi-sla'
+var scopedDceName = useExistingAmpls ? 'scoped-dce-sla-${scopedNameSuffix}' : 'scoped-dce-sla'
+
+resource ampls 'Microsoft.Insights/privateLinkScopes@2021-09-01' = if (!useExistingAmpls) {
+  name: amplsName
   location: 'global'
   tags: tags
   properties: {
@@ -338,16 +390,27 @@ resource ampls 'Microsoft.Insights/privateLinkScopes@2021-09-01' = {
   }
 }
 
-resource amplsWorkspace 'Microsoft.Insights/privateLinkScopes/scopedResources@2021-09-01' = {
-  parent: ampls
-  name: 'scoped-${workspaceName}'
-  properties: { linkedResourceId: workspace.id }
+// Chained so the scope is updated one resource at a time.
+module amplsLinkWorkspace 'ampls-link.bicep' = {
+  name: 'ampls-link-workspace'
+  scope: resourceGroup(amplsSubscriptionId, amplsResourceGroup)
+  params: {
+    amplsName: amplsName
+    scopedResourceName: scopedWorkspaceName
+    linkedResourceId: workspace.id
+  }
+  dependsOn: [ ampls ]
 }
 
-resource amplsAppInsights 'Microsoft.Insights/privateLinkScopes/scopedResources@2021-09-01' = {
-  parent: ampls
-  name: 'scoped-appi-sla'
-  properties: { linkedResourceId: appInsights.id }
+module amplsLinkAppInsights 'ampls-link.bicep' = {
+  name: 'ampls-link-appinsights'
+  scope: resourceGroup(amplsSubscriptionId, amplsResourceGroup)
+  params: {
+    amplsName: amplsName
+    scopedResourceName: scopedAppInsightsName
+    linkedResourceId: appInsights.id
+  }
+  dependsOn: [ amplsLinkWorkspace ]
 }
 
 // ---------------------------------------------------------------------------
@@ -385,10 +448,15 @@ resource dce 'Microsoft.Insights/dataCollectionEndpoints@2023-03-11' = {
   }
 }
 
-resource amplsDce 'Microsoft.Insights/privateLinkScopes/scopedResources@2021-09-01' = {
-  parent: ampls
-  name: 'scoped-dce-sla'
-  properties: { linkedResourceId: dce.id }
+module amplsLinkDce 'ampls-link.bicep' = {
+  name: 'ampls-link-dce'
+  scope: resourceGroup(amplsSubscriptionId, amplsResourceGroup)
+  params: {
+    amplsName: amplsName
+    scopedResourceName: scopedDceName
+    linkedResourceId: dce.id
+  }
+  dependsOn: [ amplsLinkAppInsights ]
 }
 
 resource dcr 'Microsoft.Insights/dataCollectionRules@2023-03-11' = {
@@ -415,12 +483,12 @@ resource dcr 'Microsoft.Insights/dataCollectionRules@2023-03-11' = {
   dependsOn: [ inventoryTable ]
 }
 
-resource peAmpls 'Microsoft.Network/privateEndpoints@2023-11-01' = {
+resource peAmpls 'Microsoft.Network/privateEndpoints@2023-11-01' = if (!useExistingAmpls) {
   name: 'pe-ampls-sla'
   location: location
   tags: tags
   properties: {
-    subnet: { id: peSubnet.id }
+    subnet: { id: peSubnetId }
     privateLinkServiceConnections: [
       {
         name: 'azuremonitor'
@@ -431,21 +499,22 @@ resource peAmpls 'Microsoft.Network/privateEndpoints@2023-11-01' = {
       }
     ]
   }
-  dependsOn: [ amplsWorkspace, amplsAppInsights, amplsDce ]
+  dependsOn: [ amplsLinkWorkspace, amplsLinkAppInsights, amplsLinkDce ]
 }
 
-resource peAmplsDns 'Microsoft.Network/privateEndpoints/privateDnsZoneGroups@2023-11-01' = {
+resource peAmplsDns 'Microsoft.Network/privateEndpoints/privateDnsZoneGroups@2023-11-01' = if (!useExistingAmpls && createPrivateDnsZoneGroups) {
   parent: peAmpls
   name: 'default'
   properties: {
     privateDnsZoneConfigs: [
-      { name: 'monitor', properties: { privateDnsZoneId: dnsZones[zMonitor].id } }
-      { name: 'oms', properties: { privateDnsZoneId: dnsZones[zOms].id } }
-      { name: 'ods', properties: { privateDnsZoneId: dnsZones[zOds].id } }
-      { name: 'agentsvc', properties: { privateDnsZoneId: dnsZones[zAgent].id } }
-      { name: 'blob', properties: { privateDnsZoneId: dnsZones[zBlob].id } }
+      { name: 'monitor', properties: { privateDnsZoneId: dnsZoneIds[zMonitor] } }
+      { name: 'oms', properties: { privateDnsZoneId: dnsZoneIds[zOms] } }
+      { name: 'ods', properties: { privateDnsZoneId: dnsZoneIds[zOds] } }
+      { name: 'agentsvc', properties: { privateDnsZoneId: dnsZoneIds[zAgent] } }
+      { name: 'blob', properties: { privateDnsZoneId: dnsZoneIds[zBlob] } }
     ]
   }
+  dependsOn: [ dnsZones ]
 }
 
 // ---------------------------------------------------------------------------
@@ -472,7 +541,7 @@ resource func 'Microsoft.Web/sites@2024-04-01' = {
     serverFarmId: plan.id
     httpsOnly: true
     publicNetworkAccess: 'Disabled'
-    virtualNetworkSubnetId: funcSubnet.id
+    virtualNetworkSubnetId: funcSubnetId
     functionAppConfig: {
       deployment: {
         storage: {
@@ -507,8 +576,10 @@ resource func 'Microsoft.Web/sites@2024-04-01' = {
   }
   dependsOn: [
     deploymentContainer
+    dnsLinks
     peStorageDns
     peAmplsDns
+    amplsLinkDce
   ]
 }
 
@@ -518,7 +589,7 @@ resource peSite 'Microsoft.Network/privateEndpoints@2023-11-01' = {
   location: location
   tags: tags
   properties: {
-    subnet: { id: peSubnet.id }
+    subnet: { id: peSubnetId }
     privateLinkServiceConnections: [
       {
         name: 'sites'
@@ -531,12 +602,12 @@ resource peSite 'Microsoft.Network/privateEndpoints@2023-11-01' = {
   }
 }
 
-resource peSiteDns 'Microsoft.Network/privateEndpoints/privateDnsZoneGroups@2023-11-01' = {
+resource peSiteDns 'Microsoft.Network/privateEndpoints/privateDnsZoneGroups@2023-11-01' = if (createPrivateDnsZoneGroups) {
   parent: peSite
   name: 'default'
   properties: {
     privateDnsZoneConfigs: [
-      { name: 'sites', properties: { privateDnsZoneId: dnsZones[zSites].id } }
+      { name: 'sites', properties: { privateDnsZoneId: dnsZoneIds[zSites] } }
     ]
   }
 }
@@ -636,7 +707,8 @@ output functionAppName        string = func.name
 output storageAccount         string = storage.name
 output reportsContainer       string = reportsContainerName
 output reportBlobPathHint     string = 'Reports are private. Read via Portal Storage browser / Storage Explorer with Storage Blob Data Reader on ${storage.name}/${reportsContainerName} over the private endpoint.'
-output vnetId                 string = vnet.id
+output vnetId                 string = useExistingVnet ? existingFunctionVnetId : vnet.id
+output amplsResourceId        string = useExistingAmpls ? existingAmplsResourceId : ampls.id
 output inventoryTable         string = inventoryTableName
 output dataCollectionRuleId   string = dcr.id
 output workbookResourceId     string = workbook.id

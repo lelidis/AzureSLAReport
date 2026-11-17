@@ -37,7 +37,8 @@ The workbook strictly excludes user-initiated actions from SLA math (uses `reaso
   - Function App on a **Flex Consumption** plan (Linux, PowerShell 7.6) with two timer functions, `RefreshInventory` (daily, `0 30 2 * * *`) and `GenerateSlaReport` (`0 0 6 1 * *`, 1st of month 06:00 UTC); public access **Disabled**, a system-assigned identity and no connection strings
   - RBAC for the Function identity: `Log Analytics Reader` on the workspace, `Monitoring Metrics Publisher` on the data collection rule, plus `Storage Blob Data Owner`, `Storage Queue Data Contributor` and `Storage Table Data Contributor` on the storage account (the Functions host and the code package use the identity)
   - Azure Workbook (queries injected from `workbook-compute-sla.json`)
-- [platform/function/](platform/function/) — PowerShell Function App code: `host.json`, `Shared/SlaCommon.ps1` (managed-identity REST helpers, the 49-service catalog and the Azure Resource Graph inventory), `RefreshInventory/` and `GenerateSlaReport/`. Both functions are pure REST with the managed identity (no Az modules). `RefreshInventory` writes the Resource Graph inventory to `SlaInventory_CL`; `GenerateSlaReport` reads the events through the Log Analytics query API, computes per-resource and region×month availability, and writes HTML/CSV to the private `reports` container. Deployed separately from the template (see step 2 of "After the hub template deploys").
+  - Optional: reuse your own VNet, Azure Monitor Private Link Scope and private DNS zones (also from other subscriptions) instead of creating them — see [Use an existing network, Private Link scope and private DNS zones](#use-an-existing-network-private-link-scope-and-private-dns-zones)
+- [platform/ampls-link.bicep](platform/ampls-link.bicep) — Small module used by `main.bicep` to add the workspace, App Insights and the data collection endpoint to the Private Link scope. A module so the scope can live in another resource group or subscription. — PowerShell Function App code: `host.json`, `Shared/SlaCommon.ps1` (managed-identity REST helpers, the 49-service catalog and the Azure Resource Graph inventory), `RefreshInventory/` and `GenerateSlaReport/`. Both functions are pure REST with the managed identity (no Az modules). `RefreshInventory` writes the Resource Graph inventory to `SlaInventory_CL`; `GenerateSlaReport` reads the events through the Log Analytics query API, computes per-resource and region×month availability, and writes HTML/CSV to the private `reports` container. Deployed separately from the template (see step 2 of "After the hub template deploys").
 - [platform/activity-export.bicep](platform/activity-export.bicep) — **Subscription scope.** Deploys per monitored subscription:
   - Activity Log diagnostic setting → workspace (`ResourceHealth` + `Administrative`)
   - `Reader` role assignment for the SLA report identity (so the Azure Resource Graph inventory works)
@@ -90,7 +91,7 @@ SlaInventory_CL
 
 - Azure CLI 2.55+ with Bicep (`az bicep install`).
 - The `Microsoft.App` resource provider registered (`az provider register -n Microsoft.App`) and a region that supports Flex Consumption (`az functionapp list-flexconsumption-locations -o table`).
-- **Network line-of-sight to the private endpoints** for anyone deploying the Function code, reading the report, or opening the workbook (run from a host on the VNet, or via ExpressRoute/VPN/peering that can reach `vnet-sla`). The default `10.50.0.0/24` address space must not overlap your existing networks — override `vnetAddressPrefix`/`privateEndpointSubnetPrefix`/`functionSubnetPrefix` if it does.
+- **Network line-of-sight to the private endpoints** for anyone deploying the Function code, reading the report, or opening the workbook (run from a host on the VNet, or via ExpressRoute/VPN/peering that can reach `vnet-sla`). The default `10.50.0.0/24` address space must not overlap your existing networks — override `vnetAddressPrefix`/`privateEndpointSubnetPrefix`/`functionSubnetPrefix` if it does, or [use your existing network](#use-an-existing-network-private-link-scope-and-private-dns-zones).
 - **Outbound HTTPS to `management.azure.com` — nothing else.** The Function reads the resource inventory from Azure Resource Graph. The template provides that path: a NAT gateway (fixed hourly charge, see the Azure pricing page) plus an NSG that allows only the `AzureResourceManager` service tag and blocks every other internet destination. If you route egress through your own firewall or use ARM Private Link, deploy with `deployNatGateway=false`.
 - Permission to deploy at:
   - Resource group scope in the “hub” subscription that hosts the workspace and workbook.
@@ -124,7 +125,7 @@ Click the button at the top of this README, or use this direct link (pinned to t
 
 > https://portal.azure.com/#create/Microsoft.Template/uri/https%3A%2F%2Fraw.githubusercontent.com%2Flelidis%2FAzureSLAReport%2Fa3b8b29054352c13dc2d36e945eac354f713ac52%2Fplatform%2Fmain.json/createUIDefinitionUri/https%3A%2F%2Fraw.githubusercontent.com%2Flelidis%2FAzureSLAReport%2Fa3b8b29054352c13dc2d36e945eac354f713ac52%2Fplatform%2FcreateUiDefinition.json
 
-The form prompts for subscription, resource group, location, workspace name, retention, storage account name and whether to create the NAT gateway for the Azure Resource Graph call (keep it checked unless you route that egress through your own firewall). The Function App and plan names use the template defaults. The VNet, subnets, private endpoints, AMPLS and private DNS use the template defaults (`10.50.0.0/24` address space) — review the [Prerequisites](#prerequisites) if that range clashes with your network, and in that case use Option B/C so you can override `vnetAddressPrefix`/`privateEndpointSubnetPrefix`/`functionSubnetPrefix`.
+The form prompts for subscription, resource group, location, workspace name, retention, storage account name and whether to create the NAT gateway for the Azure Resource Graph call (keep it checked unless you route that egress through your own firewall). The Function App and plan names use the template defaults. The VNet, subnets, private endpoints, AMPLS and private DNS use the template defaults (`10.50.0.0/24` address space) — review the [Prerequisites](#prerequisites) if that range clashes with your network, and in that case use Option B/C so you can override `vnetAddressPrefix`/`privateEndpointSubnetPrefix`/`functionSubnetPrefix`. The portal form cannot reuse an existing VNet, Private Link scope or private DNS zones either: for that, use Option B/C with the [existing-resources parameters](#use-an-existing-network-private-link-scope-and-private-dns-zones).
 
 > The button only **creates** the (private) resources. You cannot read a report from the portal form — once it finishes, continue with Phase 2 from a host that can reach the VNet. The button references [platform/main.json](platform/main.json) and [platform/createUiDefinition.json](platform/createUiDefinition.json) over `raw.githubusercontent.com`, so the repo and those two files must remain public.
 
@@ -179,11 +180,74 @@ Outputs include:
 - `storageAccount` — name of the storage account hosting the report
 - `reportsContainer` — the private blob container the report is written to
 - `reportBlobPathHint` — how to read the private report
-- `vnetId` — the VNet hosting the private endpoints
+- `vnetId` — the VNet hosting the private endpoints (`vnet-sla`, or the VNet of your existing Function subnet)
+- `amplsResourceId` — the Private Link scope in use (`ampls-sla`, or your existing scope)
 - `inventoryTable` / `dataCollectionRuleId` — the workspace table the workbook reads and the rule the Function writes it through
 - `workbookResourceId` — open this in the portal
 
 Add `--parameters deployNatGateway=false` to the command above if you provide the egress to `management.azure.com` yourself (hub firewall or ARM Private Link).
+
+## Use an existing network, Private Link scope and private DNS zones
+
+By default the template creates its own VNet (`vnet-sla`), Azure Monitor Private Link Scope and private DNS zones. If you already run a hub network, a central Private Link scope or central private DNS zones, in any resource group or **subscription**, point the template at them instead. The three parts are independent: use any combination. They are template parameters rather than portal-form fields, so deploy with [Option B or C](#phase-1--create-the-infrastructure-choose-one-option) and a parameters file. Phase 2 and Phase 3 are unchanged.
+
+| Parameter | Default | Effect |
+| --- | --- | --- |
+| `existingPrivateEndpointSubnetId` and `existingFunctionSubnetId` | empty | Use these subnets (resource IDs) instead of creating `vnet-sla`. **Set both.** No VNet, NSG or NAT gateway is created and neither subnet is modified. |
+| `existingAmplsResourceId` | empty | Add the workspace, Application Insights and the data collection endpoint to this Private Link scope. No scope and no scope private endpoint are created. |
+| `existingPrivateDnsZoneIds` | `{}` | Resource IDs of existing private DNS zones, keyed as in the table below. A listed zone is used as is; every zone you leave out is created in the resource group and linked to the Function's VNet. |
+| `createPrivateDnsZoneGroups` | `true` | Set `false` when DNS records come from Azure Policy or central automation: no zones, links or zone groups are created and the private endpoints get no DNS records from this template. |
+
+| `existingPrivateDnsZoneIds` key | Private DNS zone | Used by |
+| --- | --- | --- |
+| `blob`, `queue`, `table` | `privatelink.blob.core.windows.net`, `privatelink.queue.core.windows.net`, `privatelink.table.core.windows.net` | Storage private endpoints |
+| `sites` | `privatelink.azurewebsites.net` | Function private endpoint |
+| `monitor`, `oms`, `ods`, `agentsvc` | `privatelink.monitor.azure.com`, `privatelink.oms.opinsights.azure.com`, `privatelink.ods.opinsights.azure.com`, `privatelink.agentsvc.azure-automation.net` | Private endpoint of a scope this template creates (not needed with `existingAmplsResourceId`) |
+
+Example parameters file (all three parts; save as `byo.parameters.json`):
+
+```json
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "workspaceName": { "value": "law-sla-prod" },
+    "storageAccountName": { "value": "stslareportprod" },
+    "existingPrivateEndpointSubnetId": { "value": "/subscriptions/<netSub>/resourceGroups/<netRg>/providers/Microsoft.Network/virtualNetworks/<vnet>/subnets/<peSubnet>" },
+    "existingFunctionSubnetId": { "value": "/subscriptions/<netSub>/resourceGroups/<netRg>/providers/Microsoft.Network/virtualNetworks/<vnet>/subnets/<functionSubnet>" },
+    "existingAmplsResourceId": { "value": "/subscriptions/<monSub>/resourceGroups/<monRg>/providers/Microsoft.Insights/privateLinkScopes/<scope>" },
+    "existingPrivateDnsZoneIds": {
+      "value": {
+        "blob": "/subscriptions/<dnsSub>/resourceGroups/<dnsRg>/providers/Microsoft.Network/privateDnsZones/privatelink.blob.core.windows.net",
+        "queue": "/subscriptions/<dnsSub>/resourceGroups/<dnsRg>/providers/Microsoft.Network/privateDnsZones/privatelink.queue.core.windows.net",
+        "table": "/subscriptions/<dnsSub>/resourceGroups/<dnsRg>/providers/Microsoft.Network/privateDnsZones/privatelink.table.core.windows.net",
+        "sites": "/subscriptions/<dnsSub>/resourceGroups/<dnsRg>/providers/Microsoft.Network/privateDnsZones/privatelink.azurewebsites.net"
+      }
+    }
+  }
+}
+```
+
+```powershell
+az deployment group create -g $rg -f ./platform/main.json -p '@byo.parameters.json'
+```
+
+**What must already be true**
+
+- *Existing subnets.* Both are in the Function's region (the resource group's location unless you set `location`). The Function subnet is delegated to `Microsoft.App/environments`, is `/27` or larger and is used by nothing else. The template does not change it, so **you provide its egress**: outbound TCP 443 to `management.azure.com` (the Azure Resource Graph call) through a NAT gateway, your firewall/UDR or ARM Private Link; the NSG and NAT gateway of the default build are not created. Any NSG on the private endpoint subnet must allow inbound 443 from the Function subnet.
+- *Existing Private Link scope.* Its private endpoint, with working DNS for the Function's VNet, already exists: this template creates none in this mode, and a VNet can connect to only one scope. The workspace, Application Insights and data collection endpoint are created with public access disabled, so they are reachable only through that endpoint. They are added as scoped resources named `scoped-<workspace>-<suffix>`, `scoped-appi-sla-<suffix>` and `scoped-dce-sla-<suffix>`; the suffix is unique per resource group, so several deployments can share one scope.
+- *Existing private DNS zones.* Each zone you pass already resolves from the Function's VNet (linked to it, or reached through your DNS forwarders). The template only writes the private endpoint records into it through a zone group; it never links or changes an existing zone. Zones you leave out are created and linked to the Function's VNet.
+
+**Permissions for the identity that runs the deployment**, in addition to the usual deployment rights on the target resource group:
+
+| Resource | Permission |
+| --- | --- |
+| Existing subnets | `Microsoft.Network/virtualNetworks/subnets/join/action` on both (included in *Network Contributor*) |
+| Existing private DNS zones | `Microsoft.Network/privateDnsZones/join/action` and permission to write the private endpoint records, for example *Private DNS Zone Contributor*, on each zone you pass |
+| VNet, when the template creates and links zones | `Microsoft.Network/virtualNetworks/join/action` on the VNet |
+| Existing Private Link scope | `Microsoft.Insights/privateLinkScopes/scopedResources/write` plus `Microsoft.Resources/deployments/write` in the scope's resource group (*Contributor* there is enough): the template runs a small nested deployment in that group |
+
+`Test-SlaPlatform.ps1` understands these deployments: it expects 4 private endpoints (5 when the template creates the scope) and reports the Function subnet check as `SKIP` if it cannot read a subnet in another subscription.
 
 ## After the hub template deploys (required for all options)
 
@@ -403,6 +467,10 @@ SlaInventory_CL
 | `403` or `AuthorizationPermissionMismatch` writing the report | The Function identity is missing `Storage Blob Data Owner` on the storage account (the template assigns it; role propagation can take a few minutes). |
 | Deployment command cannot connect | The host is not on the VNet or cannot resolve the private DNS zone. Verify with `nslookup $functionAppName.scm.azurewebsites.net`. |
 | Workbook or Logs blade shows connection errors in the portal | Your browser must reach the AMPLS private endpoint over your corporate network. Allow local network access for the portal in Edge/Chrome if prompted. |
+| `AuthorizationFailed` on `.../subnets/join/action`, `.../privateDnsZones/join/action` or `.../virtualNetworks/join/action` | The deploying identity lacks join permission on the existing subnet, private DNS zone or VNet. Grant it on that resource (for example *Network Contributor* on the subnet, *Private DNS Zone Contributor* on the zone) and redeploy. |
+| The nested deployment `ampls-link-*` fails with `AuthorizationFailed` | Adding a scoped resource to an existing Private Link scope needs `Microsoft.Insights/privateLinkScopes/scopedResources/write` and `Microsoft.Resources/deployments/write` in the scope's resource group. |
+| Storage, the Function or Log Analytics resolve to public addresses and calls fail | With an existing private DNS zone, the zone is not linked to (or resolvable from) the Function's VNet. Link it or forward it to your resolver; the template never links an existing zone. |
+| With an existing VNet, a run fails with a timeout toward `management.azure.com` | The existing Function subnet has no outbound path to Azure Resource Manager on TCP 443. Add a NAT gateway, a firewall route or ARM Private Link to that subnet. |
 
 ## Adding or removing services
 
@@ -445,6 +513,14 @@ The Functions use an equivalent catalog (`$script:ServiceCatalog`) in [platform/
    az monitor private-link-scope scoped-resource delete -g $rg --scope-name ampls-sla -n scoped-<workspaceName> --yes
    az monitor log-analytics workspace delete -g $rg -n <workspaceName> --force true --yes
    ```
+
+   With `existingAmplsResourceId`, the three scoped resources live in your scope, not in `$rg`. List and delete them there first:
+
+   ```powershell
+   az monitor private-link-scope scoped-resource list -g <scopeRg> --scope-name <scope> --subscription <scopeSub> --query "[?contains(lower(linkedResourceId), '/resourcegroups/$($rg.ToLower())/')].name" -o tsv
+   az monitor private-link-scope scoped-resource delete -g <scopeRg> --scope-name <scope> --subscription <scopeSub> -n <name> --yes
+   ```
+
 ## Notes and limitations
 
 - The workbook reads `AzureActivity` (`ResourceHealth` + optional `Administrative`). It does not require per-resource diagnostic settings.
